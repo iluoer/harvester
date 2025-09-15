@@ -19,7 +19,6 @@ from .stabilityai import StabilityAIProvider
 from .vertex import VertexProvider
 from .generic_bearer import GenericBearerTokenProvider
 from .tencent_asr import TencentASRProvider
-from .iflytek_speech import IflytekSpeechProvider
 
 __all__ = [
     "AIBaseProvider",
@@ -37,5 +36,4 @@ __all__ = [
     "VertexProvider",
     "GenericBearerTokenProvider",
     "TencentASRProvider",
-    "IflytekSpeechProvider",
 ]

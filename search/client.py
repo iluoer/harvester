@@ -83,7 +83,8 @@ from constant.system import (
 from core.exceptions import NetworkError, ValidationError
 from core.models import RateLimitConfig
 from core.types import IAuthProvider
-from tools.coordinator import get_user_agent
+from tools.coordinator import get_user_agent, get_token
+
 from tools.ratelimit import RateLimiter
 from tools.resources import managed_network
 from tools.retry import network_retry
@@ -511,10 +512,50 @@ def search_github_api(query: str, token: str, page: int = 1, peer_page: int = AP
             if isblank(link):
                 continue
             links.add(link)
-
         return list(links)
     except Exception:
         return []
+
+@handle_exceptions(default_result="", log_level="error")
+def get_file_via_contents_api(html_url: str) -> str:
+    """Fetch file content using GitHub Contents API to avoid web scraping EOF.
+
+    html_url example:
+      https://github.com/{owner}/{repo}/blob/{branch}/path/to/file.ext
+    We'll convert it to:
+      GET https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}
+    and base64-decode the content field.
+    """
+    try:
+        if not isinstance(html_url, str) or "/blob/" not in html_url:
+            return ""
+        parts = urllib.parse.urlparse(html_url)
+        segs = [s for s in parts.path.split("/") if s]
+        if len(segs) < 5 or segs[2] != "blob":
+            return ""
+        owner, repo, branch = segs[0], segs[1], segs[3]
+        path = "/".join(segs[4:])
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={urllib.parse.quote(branch)}"
+        token = get_token() or ""
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": get_user_agent(),
+        }
+        if token:
+            headers["Authorization"] = f"token {token}"
+        content = http_get(url=api_url, headers=headers, retries=5, interval=1.2, timeout=60)
+        if not content:
+            return ""
+        data = json.loads(content)
+        enc = (data or {}).get("encoding", "")
+        raw = (data or {}).get("content", "")
+        if enc != "base64" or not raw:
+            return ""
+        import base64
+        decoded = base64.b64decode(raw.encode("utf-8")).decode("utf-8", "ignore")
+        return decoded
+    except Exception:
+        return ""
 
 
 def search_web_with_count(
@@ -882,18 +923,20 @@ def collect(
         except Exception:
             fetch_url = url
 
-        try:
-            content = http_get(url=fetch_url, retries=retries, interval=COLLECT_RETRY_INTERVAL)
-        except Exception:
-            # Treat network errors as empty content so we can try fallback
-            content = ""
+        # Prefer Contents API to avoid web scraping EOFs
+        content = get_file_via_contents_api(fetch_url)
+        if not content:
+            try:
+                # Stronger retry for web fetch as a last resort
+                content = http_get(url=fetch_url, retries=max(7, retries), interval=max(1.2, COLLECT_RETRY_INTERVAL), timeout=75)
+            except Exception:
+                content = ""
 
-        # Fallback: try raw.githubusercontent.com if plain fetch failed
+        # Fallback: try raw.githubusercontent.com if both API and web failed
         if not content and url.startswith("https://github.com/") and "/blob/" in url:
             try:
                 parts = urllib.parse.urlparse(url)
                 segs = [s for s in parts.path.split("/") if s]
-                # Expect: /{owner}/{repo}/blob/{branch}/...path
                 if len(segs) >= 5 and segs[2] == "blob":
                     _repo_owner, _repo_name, _repo_branch = segs[0], segs[1], segs[3]
                     _repo_file = "/".join(segs[4:])
@@ -901,7 +944,7 @@ def collect(
                         return []
                     raw_url = f"https://raw.githubusercontent.com/{_repo_owner}/{_repo_name}/{_repo_branch}/{_repo_file}"
                     try:
-                        content = http_get(url=raw_url, retries=retries, interval=COLLECT_RETRY_INTERVAL)
+                        content = http_get(url=raw_url, retries=max(7, retries), interval=max(1.2, COLLECT_RETRY_INTERVAL), timeout=75)
                     except Exception:
                         content = ""
             except Exception:
@@ -960,7 +1003,11 @@ def collect(
                 t = str(s or "").strip().lower()
                 if not t:
                     return True
-                bad_sub = ("your", "example", "sample", "test", "mock", "dummy", "xxxx", "xxxxx", "replace")
+                bad_sub = (
+                    "your", "example", "sample", "test", "mock", "dummy",
+                    "xxxx", "xxxxx", "xxx", "replace", "template", "default",
+                    "config", "prompt", "appid", "app_id"
+                )
                 if any(x in t for x in bad_sub):
                     return True
                 # common forms like sk-ant-your-...-here or api_key_here
@@ -1026,17 +1073,14 @@ def collect(
             return half_candidates
 
         # Optional address/model extraction (global in file)
+        # Be lenient: if address/model patterns are provided but not found, fallback to empty values
         address_pattern = trim(address_pattern)
         addresses = extract(text=content, regex=address_pattern) if address_pattern else [""]
-        if address_pattern and not addresses:
-            return []
         if not addresses:
             addresses = [""]
 
         model_pattern = trim(model_pattern)
         models = extract(text=content, regex=model_pattern) if model_pattern else [""]
-        if model_pattern and not models:
-            return []
         if not models:
             models = [""]
 
@@ -1136,7 +1180,7 @@ def collect(
     models = extract(text=content, regex=model_pattern)
     need_model = False
     if model_pattern and not models:
-        # Do not drop; allow half-candidate (e.g., Iflytek has key but missing APPID)
+        # Do not drop; allow half-candidate when model pattern exists but not found
         need_model = True
         models = [""]
     if not models:

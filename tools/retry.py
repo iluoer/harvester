@@ -336,16 +336,25 @@ def network_retry(func: Callable) -> Callable:
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        # Extract retry configuration parameters from function arguments
-        retries = kwargs.get("retries", 3)
-        interval = kwargs.get("interval", 1.0)
+        # Extract retry config from bound arguments with defaults applied
+        try:
+            import inspect
+            sig = inspect.signature(func)
+            ba = sig.bind_partial(*args, **kwargs)
+            ba.apply_defaults()
+            retries = ba.arguments.get("retries", 3)
+            interval = ba.arguments.get("interval", 1.0)
+        except Exception:
+            # Fallback to kwargs-only extraction
+            retries = kwargs.get("retries", 3)
+            interval = kwargs.get("interval", 1.0)
 
         # Validate and normalize parameters
         try:
             retries = max(1, int(retries)) if retries is not None else 3
             interval = max(0.1, float(interval)) if interval is not None else 1.0
         except (ValueError, TypeError):
-            # Fall back to defaults if parameter conversion fails
+            # Fall back to sane defaults if parameter conversion fails
             retries = 3
             interval = 1.0
             logger.warning(f"Invalid retry parameters for {func.__name__}, using defaults")

@@ -4,12 +4,14 @@
 Doubao provider implementation.
 """
 
+import urllib.parse
 from typing import List
 
 from core.enums import ErrorReason
 from core.models import CheckResult, Condition
 from tools.utils import trim
 
+from ..client import chat
 from .openai_like import OpenAILikeProvider
 from .registry import register_provider
 
@@ -41,12 +43,42 @@ class DoubaoProvider(OpenAILikeProvider):
         return super()._judge(code, message)
 
     def check(self, token: str, address: str = "", endpoint: str = "", model: str = "") -> CheckResult:
-        """Check Doubao token validity."""
-        model = trim(model)
-        if not model:
-            model = self._default_model
+        """Check Doubao token validity.
 
-        return super().check(token=token, address=address, endpoint=endpoint, model=model)
+        Doubao (Volcengine Ark) can use either the model name or the EndpointId (ep-...)
+        as the "model" parameter. Prefer the provided EndpointId when available and
+        also attach it as X-Endpoint-Id header to maximize compatibility across SDKs.
+        """
+        # Build headers with optional endpoint id
+        additional = {}
+        ep = trim(endpoint)
+        if ep:
+            additional["X-Endpoint-Id"] = ep
+        headers = self._get_headers(token=token, additional=additional)
+        if not headers:
+            return CheckResult.fail(ErrorReason.BAD_REQUEST)
+
+        # Resolve URL and model: use endpoint id if provided, else fallback to default
+        chosen_model = trim(model) or (ep if ep else self._default_model)
+        url = urllib.parse.urljoin(self._base_url, self.completion_path)
+
+        code, message = chat(url=url, headers=headers, model=chosen_model)
+        return self._judge(code=code, message=message)
+
+    def inspect(self, token: str, address: str = "", endpoint: str = "") -> List[str]:
+        """List available Doubao models for this token/endpoint scope.
+
+        Attaches X-Endpoint-Id when provided to scope model listing. Best-effort.
+        """
+        additional = {}
+        ep = trim(endpoint)
+        if ep:
+            additional["X-Endpoint-Id"] = ep
+        headers = self._get_headers(token=token, additional=additional)
+        if not headers:
+            return []
+        url = urllib.parse.urljoin(self._base_url, self.model_path)
+        return self._fetch_models(url=url, headers=headers)
 
 
 register_provider("doubao", DoubaoProvider)

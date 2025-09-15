@@ -183,12 +183,11 @@ class AnthropicProvider(AIBaseProvider):
                 msg = trim(body)
                 if code == 401 or re.findall(r"invalid.*api[_-]?key", msg, flags=re.I):
                     return CheckResult.fail(ErrorReason.INVALID_KEY, message=msg, status_code=code)
-                # Treat permission denied (403) as valid credentials but no access to this action
+                # Restore previous logic: 403 -> NO_ACCESS (not valid), 402/billing -> NO_QUOTA (not valid)
                 if code == 403 and re.findall(r"permission[_-]?error|not authorized|forbidden", msg, flags=re.I):
-                    return CheckResult.success()
-                # Treat low credit/billing issues (402) as valid credentials but no quota
+                    return CheckResult.fail(ErrorReason.NO_ACCESS, message=msg, status_code=code)
                 if code == 402 or re.findall(r"credit balance is too low|billing|purchase", msg, flags=re.I):
-                    return CheckResult.success()
+                    return CheckResult.fail(ErrorReason.NO_QUOTA, message=msg, status_code=code)
                 if code == 429:
                     last_result = CheckResult.fail(ErrorReason.RATE_LIMITED, message=msg, status_code=code)
                     break

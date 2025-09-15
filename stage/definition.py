@@ -131,13 +131,27 @@ class SearchStage(BasePipelineStage):
             keys = []
             if content and task.regex:
                 keys = self._extract_keys_from_content(content, task)
+                scheduled = 0
+                skipped_half = 0
                 for key_service in keys:
+                    # If endpoint is required (endpoint_pattern configured) but missing, skip immediate check
+                    ep_required = bool(task.endpoint_pattern)
+                    has_endpoint = bool(getattr(key_service, 'endpoint', '') or '')
+                    pair_half = ''
+                    try:
+                        pair_half = (getattr(key_service, 'meta', {}) or {}).get('pair_half', '')
+                    except Exception:
+                        pair_half = ''
+                    if ep_required and (not has_endpoint or pair_half):
+                        skipped_half += 1
+                        continue
                     check_task = TaskFactory.create_check_task(task.provider, key_service)
                     output.add_task(check_task, PipelineStage.CHECK.value)
+                    scheduled += 1
 
                 if keys:
                     logger.info(
-                        f"[{self.name}] extracted {len(keys)} keys from search content, provider: {task.provider}"
+                        f"[{self.name}] extracted {len(keys)} keys from search content, scheduled checks: {scheduled}, skipped half: {skipped_half}, provider: {task.provider}"
                     )
 
             # Create acquisition tasks for links
@@ -313,6 +327,35 @@ class SearchStage(BasePipelineStage):
             logger.info(
                 f"[{self.name}] generated {len(page_tasks)} page tasks for provider: {task.provider}, query: {task.query}"
             )
+        else:
+            # Fallback: when total is unknown or <= per_page (e.g., API 401/403 blocking count),
+            # proactively fan out a minimal set of pagination tasks if configured.
+            try:
+                task_cfg = self.resources.task_configs.get(task.provider)
+                extras = getattr(task_cfg, 'extras', {}) if task_cfg else {}
+                min_pages = int(extras.get('min_pages', 0) or 0)
+            except Exception:
+                min_pages = 0
+            if min_pages and min_pages > 1:
+                forced_tasks: List[SearchTask] = []
+                for page in range(2, min_pages + 1):
+                    forced_tasks.append(
+                        SearchTask(
+                            provider=task.provider,
+                            query=task.query,
+                            regex=task.regex,
+                            page=page,
+                            use_api=task.use_api,
+                            address_pattern=task.address_pattern,
+                            endpoint_pattern=task.endpoint_pattern,
+                            model_pattern=task.model_pattern,
+                        )
+                    )
+                for page_task in forced_tasks:
+                    output.add_task(page_task, PipelineStage.SEARCH.value)
+                logger.info(
+                    f"[{self.name}] generated {len(forced_tasks)} forced page tasks (min_pages) for provider: {task.provider}, query: {task.query}"
+                )
 
     def _generate_page_tasks(self, task: SearchTask, total: int, per_page: int) -> List[SearchTask]:
         """Generate pagination tasks"""
@@ -403,11 +446,7 @@ class AcquisitionStage(BasePipelineStage):
                     if bucket["endpoint_only"]:
                         other = next(iter(bucket["endpoint_only"]))
                         bucket["endpoint_only"].discard(other)
-                        if provider == "iflytek_speech":
-                            # 对齐存储输出，endpoint 写入 APPID
-                            return Service(address=svc.address, endpoint=other, key=svc.key, model=other, meta=meta)
-                        else:
-                            return Service(address=svc.address, endpoint=other, key=svc.key, model=svc.model, meta=meta)
+                        return Service(address=svc.address, endpoint=other, key=svc.key, model=svc.model or other, meta=meta)
                     bucket["key_only"].add(svc.key)
                     return None
                 elif half == "endpoint_only":
@@ -415,18 +454,9 @@ class AcquisitionStage(BasePipelineStage):
                     if bucket["key_only"]:
                         k_val = next(iter(bucket["key_only"]))
                         bucket["key_only"].discard(k_val)
-                        if provider == "iflytek_speech":
-                            # endpoint 与 model 同写 APPID，便于落盘
-                            appid = svc.model or svc.endpoint
-                            return Service(address=svc.address, endpoint=appid, key=k_val, model=appid, meta=meta)
-                        else:
-                            return Service(address=svc.address, endpoint=svc.endpoint, key=k_val, model=svc.model, meta=meta)
+                        return Service(address=svc.address, endpoint=svc.endpoint, key=k_val, model=svc.model or svc.endpoint, meta=meta)
                     # Save the "other half" value for later pairing
-                    if provider == "iflytek_speech":
-                        # APPID 可能出现在 model 或 endpoint，优先使用 model，退而取 endpoint
-                        other_val = svc.model or svc.endpoint
-                    else:
-                        other_val = svc.endpoint
+                    other_val = svc.endpoint or svc.model
                     if other_val:
                         bucket["endpoint_only"].add(other_val)
                     return None
@@ -507,13 +537,23 @@ class AcquisitionStage(BasePipelineStage):
                         queries = [f"{repo_scope} AKID", f"{repo_scope} SecretId"]
                     elif pair_half == 'endpoint_only':
                         queries = [f"{repo_scope} SecretKey", f"{repo_scope} TENCENTCLOUD_SECRETKEY"]
-                elif prov == 'iflytek_speech':
+                elif prov == 'doubao':
                     if pair_half == 'key_only':
-                        # Have API key, need APPID
-                        queries = [f"{repo_scope} X-Appid", f"{repo_scope} APPID", f"{repo_scope} XFYUN_APPID"]
+                        # have key, need endpointId (ep-...)
+                        queries = [
+                            f"{repo_scope} ep-",
+                            f"{repo_scope} endpointId",
+                            f"{repo_scope} ep- path:.github/workflows",
+                        ]
                     elif pair_half == 'endpoint_only':
-                        # Have APPID, need API key
-                        queries = [f"{repo_scope} XFYUN_API_KEY", f"{repo_scope} IFLYTEK_API_KEY", f"{repo_scope} XF_API_KEY"]
+                        # have endpointId, need key/token
+                        queries = [
+                            f"{repo_scope} ARK_API_KEY filename:.env",
+                            f"{repo_scope} VOLCENGINE_ACCESS_TOKEN filename:.env",
+                            f"{repo_scope} VOLC_ACCESS_TOKEN filename:.env",
+                            f"{repo_scope} ARK_API_KEY path:.github/workflows",
+                        ]
+                # qianfan provider removed
                 if not queries:
                     return
                 # Bound the number of follow-up searches
@@ -522,14 +562,10 @@ class AcquisitionStage(BasePipelineStage):
                     # Choose regex according to which half we are missing
                     desired_regex = task.key_pattern or ''
                     try:
-                        if prov == 'tencent_asr':
+                        if prov in ('tencent_asr', 'doubao'):
                             if pair_half == 'key_only':
+                                # search endpoints/appid for these providers
                                 desired_regex = task.endpoint_pattern or ''
-                            elif pair_half == 'endpoint_only':
-                                desired_regex = task.key_pattern or ''
-                        elif prov == 'iflytek_speech':
-                            if pair_half == 'key_only':
-                                desired_regex = task.model_pattern or ''  # need APPID
                             elif pair_half == 'endpoint_only':
                                 desired_regex = task.key_pattern or ''
                     except Exception:
