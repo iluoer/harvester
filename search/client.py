@@ -17,6 +17,49 @@ import urllib.request
 from typing import Callable, Dict, List, Optional, Tuple
 
 from core.models import Service
+
+# --- Credential cooldown (simple in-process store) ---
+_token_cooldown: Dict[str, float] = {}
+_session_cooldown: Dict[str, float] = {}
+
+def _now() -> float:
+    return time.time()
+
+def _cleanup_cooldown() -> None:
+    now = _now()
+    for store in (_token_cooldown, _session_cooldown):
+        expired = [k for k, t in store.items() if t <= now]
+        for k in expired:
+            try:
+                del store[k]
+            except Exception:
+                pass
+
+def mark_token_cooldown(token: str, seconds: int = 900) -> None:
+    if not token:
+        return
+    _cleanup_cooldown()
+    _token_cooldown[token] = _now() + max(60, seconds)
+
+def mark_session_cooldown(session: str, seconds: int = 900) -> None:
+    if not session:
+        return
+    _cleanup_cooldown()
+    _session_cooldown[session] = _now() + max(60, seconds)
+
+def is_token_on_cooldown(token: Optional[str]) -> bool:
+    if not token:
+        return False
+    _cleanup_cooldown()
+    exp = _token_cooldown.get(token, 0)
+    return exp > _now()
+
+def is_session_on_cooldown(session: Optional[str]) -> bool:
+    if not session:
+        return False
+    _cleanup_cooldown()
+    exp = _session_cooldown.get(session, 0)
+    return exp > _now()
 from tools.logger import get_logger
 from tools.utils import encoding_url, isblank, trim
 
@@ -134,6 +177,12 @@ class GitHubClient:
             logger.debug(f"Rate limit acquisition failed for {service}")
             return ""
 
+        # Jitter to avoid synchronized bursts
+        try:
+            time.sleep(random.uniform(0.08, 0.2))
+        except Exception:
+            pass
+
         # Make request using original http_get
         result = http_get(url, headers, params, retries, interval, timeout)
         success = bool(result)
@@ -162,6 +211,18 @@ def get_github_client() -> GitHubClient:
         # Fallback client without rate limiting
         return GitHubClient()
     return _github_client
+
+
+
+def set_github_client_rate_limiter(limiter: RateLimiter) -> None:
+    """Bind a shared RateLimiter instance to the GitHub client.
+
+    This avoids creating a separate limiter and ensures unified rate control
+    with the pipeline's global limiter.
+    """
+    global _github_client
+    _github_client = GitHubClient(limiter)
+    logger.info("GitHub client bound to shared rate limiter")
 
 
 def get_github_stats() -> Dict[str, Dict[str, float]]:
@@ -204,9 +265,9 @@ def http_get(
     url: str,
     headers: Optional[Dict] = None,
     params: Optional[Dict] = None,
-    retries: int = 3,
+    retries: int = 5,
     interval: float = 1.0,
-    timeout: float = 10,
+    timeout: float = 60,
 ) -> str:
     """HTTP GET request with configurable retry handling
 
@@ -270,12 +331,22 @@ def http_get(
                     raise NetworkError("Failed to decode response content")
 
     except urllib.error.HTTPError as e:
-        # Handle HTTP errors with basic classification
-        if e.code == 429:
-            # Rate limit errors should be retried
-            raise ConnectionError(f"Rate limit exceeded (HTTP {e.code})")
+        # Handle HTTP errors with classification and body inspection for GitHub abuse
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "ignore") if hasattr(e, "read") else ""
+        except Exception:
+            body = ""
+        lower = (body or e.reason or "").lower()
+        if e.code == 429 or (e.code == 403 and ("abuse" in lower or "secondary rate limit" in lower)):
+            # Rate limit / abuse detection should be retried
+            raise ConnectionError(f"Retryable limit (HTTP {e.code}): {e.reason or body}")
         elif e.code in (401, 403):
-            # Auth errors should not be retried
+            # Auth errors should not be retried; additionally mark credential cooldown
+            cred = headers.get("Authorization") if headers else None
+            if cred and cred.lower().startswith("token "):
+                mark_token_cooldown(cred.split(" ",1)[1])
+            # For web (no Authorization), upper stack will call mark_session_cooldown when seeing login page or 401
             raise NetworkError(f"Authentication failed (HTTP {e.code})")
         elif e.code >= 500:
             # Server errors should be retried
@@ -384,11 +455,19 @@ def search_github_web(query: str, session: str, page: int) -> str:
         "Cookie": f"user_session={session}",
     }
 
+    # Skip sessions that are currently on cooldown
+    if is_session_on_cooldown(session):
+        return ""
+
     client = get_github_client()
     content = client.get(url=url, headers=headers)
     if re.search(r"<h1>Sign in to GitHub</h1>", content, flags=re.I):
         logger.error("[GithubCrawl] Session has expired, please provide a valid session and try again")
+        mark_session_cooldown(session, seconds=1800)
         return ""
+
+    if re.search(r"(abuse|secondary rate limit|too many requests)", content or "", flags=re.I):
+        mark_session_cooldown(session, seconds=900)
 
     return content
 
@@ -402,9 +481,19 @@ def search_github_api(query: str, token: str, page: int = 1, peer_page: int = AP
     url = f"https://api.github.com/search/code?q={query}&sort=indexed&order=desc&per_page={peer_page}&page={page}"
     headers: Dict[str, str] = {
         "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"token {token}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+
+    # jitter to avoid secondary rate limit bursts
+    try:
+        time.sleep(random.uniform(0.2, 0.6))
+    except Exception:
+        pass
+
+    # Skip credentials that are currently on cooldown
+    if is_token_on_cooldown(token):
+        return []
 
     client = get_github_client()
     content = client.get(url=url, headers=headers, interval=GITHUB_API_INTERVAL, timeout=GITHUB_API_TIMEOUT)
@@ -448,7 +537,8 @@ def search_web_with_count(
 
     # Extract links from content
     try:
-        regex = r'href="(/[^\s"]+/blob/(?:[^"]+)?)#L\d+"'
+        # Capture blob links with or without line anchors
+        regex = r'href="(/[^\s\"]+/blob/[^\"#]+)(?:#L\d+)?"'
         groups = re.findall(regex, content, flags=re.I)
         uris = list(set(groups)) if groups else []
         links = set()
@@ -502,7 +592,7 @@ def search_api_with_count(
     url = f"https://api.github.com/search/code?q={query}&sort=indexed&order=desc&per_page={peer_page}&page={page}"
     headers = {
         "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"token {token}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
@@ -559,7 +649,7 @@ def get_total_num(query: str, token: str) -> int:
     url = f"https://api.github.com/search/code?q={query}&sort=indexed&order=desc&per_page=20&page=1"
     headers = {
         "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"token {token}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
@@ -618,7 +708,11 @@ def estimate_web_total(query: str, session: str, content: Optional[str] = None) 
         if response:
             data = json.loads(response)
             if not data.get("failed", True):
-                count = data.get("count", 0)
+                raw = data.get("count", 0)
+                try:
+                    count = int(str(raw).replace(",", "").strip())
+                except Exception:
+                    count = 0
                 mode = data.get("mode", "unknown")
                 logger.info(f"[search] got {count} results, mode: {mode}, query: {message}")
 
@@ -629,7 +723,12 @@ def estimate_web_total(query: str, session: str, content: Optional[str] = None) 
         return extract_count_from_page(content, query)
 
     except Exception as e:
-        logger.error(f"[search] estimation failed for query: {message}, error: {e}, using conservative estimate")
+        # Downgrade log level for expected auth/limit issues during web count (handled by cooldown elsewhere)
+        msg = str(e)
+        if any(x in msg for x in ["HTTP 401", "HTTP 403", "HTTP 429", "abuse", "secondary rate limit"]):
+            logger.warning(f"[search] estimation fallback for query: {message}, reason: {e}, using conservative estimate")
+        else:
+            logger.error(f"[search] estimation failed for query: {message}, error: {e}, using conservative estimate")
         # Conservative estimate
         return WEB_RESULTS_PER_PAGE
 
@@ -692,7 +791,8 @@ def search_code(
         return [], ""
 
     try:
-        regex = r'href="(/[^\s"]+/blob/(?:[^"]+)?)#L\d+"'
+        # Capture blob links with or without line anchors
+        regex = r'href="(/[^\s\"]+/blob/[^\"#]+)(?:#L\d+)?"'
         groups = re.findall(regex, content, flags=re.I)
         uris = list(set(groups)) if groups else []
         links = set()
@@ -741,21 +841,290 @@ def collect(
     if (not isinstance(url, str) and not isinstance(text, str)) or not isinstance(key_pattern, str):
         return []
 
+    # Path-level filtering for noisy locations
+    def _is_noisy_path(u: str) -> bool:
+        try:
+            if not isinstance(u, str):
+                return False
+            low = u.lower()
+            noisy = ("example", "examples", "sample", "samples", "mock", "mocks", "test", "tests", "fixture", "fixtures", "spec", "specs", "docs", "tutorial")
+            return any(x in low for x in noisy)
+        except Exception:
+            return False
+
+    # Track GitHub context for repo-aware pairing
+    _repo_owner = _repo_name = _repo_branch = _repo_file = ""
+
     if text:
         content = text
     else:
-        content = http_get(url=url, retries=retries, interval=COLLECT_RETRY_INTERVAL)
+        # Prefer fetching plain/raw content from GitHub code pages to improve regex hit rate
+        fetch_url = url
+        try:
+            u = trim(url)
+            if _is_noisy_path(u):
+                # 不立即丢弃：若后续形成配对再判定，这里只降低优先级
+                pass
+            if u.startswith("https://github.com/") and "/blob/" in u:
+                # Strip line anchors and force plain text rendering
+                base = u.split("#", 1)[0]
+                fetch_url = base + ("&plain=1" if "?" in base and "plain=1" not in base else ("?plain=1" if "?" not in base else base))
+                try:
+                    parts = urllib.parse.urlparse(u)
+                    segs = [s for s in parts.path.split("/") if s]
+                    if len(segs) >= 5 and segs[2] == "blob":
+                        _repo_owner, _repo_name, _repo_branch = segs[0], segs[1], segs[3]
+                        _repo_file = "/".join(segs[4:])
+                        # 同理：不在此处直接丢弃，后续配对时再过滤
+                        pass
+                except Exception:
+                    pass
+        except Exception:
+            fetch_url = url
+
+        try:
+            content = http_get(url=fetch_url, retries=retries, interval=COLLECT_RETRY_INTERVAL)
+        except Exception:
+            # Treat network errors as empty content so we can try fallback
+            content = ""
+
+        # Fallback: try raw.githubusercontent.com if plain fetch failed
+        if not content and url.startswith("https://github.com/") and "/blob/" in url:
+            try:
+                parts = urllib.parse.urlparse(url)
+                segs = [s for s in parts.path.split("/") if s]
+                # Expect: /{owner}/{repo}/blob/{branch}/...path
+                if len(segs) >= 5 and segs[2] == "blob":
+                    _repo_owner, _repo_name, _repo_branch = segs[0], segs[1], segs[3]
+                    _repo_file = "/".join(segs[4:])
+                    if _is_noisy_path(_repo_file):
+                        return []
+                    raw_url = f"https://raw.githubusercontent.com/{_repo_owner}/{_repo_name}/{_repo_branch}/{_repo_file}"
+                    try:
+                        content = http_get(url=raw_url, retries=retries, interval=COLLECT_RETRY_INTERVAL)
+                    except Exception:
+                        content = ""
+            except Exception:
+                pass
 
     if not content:
         return []
 
-    # extract keys from content
+    # Precompute meta for repo-aware pairing/enrichment
+    _meta_base = {}
+    try:
+        if _repo_owner and _repo_name:
+            _meta_base = {
+                "repo_owner": _repo_owner,
+                "repo_name": _repo_name,
+                "branch": _repo_branch,
+                "file_path": _repo_file,
+                "source_url": url or "",
+            }
+    except Exception:
+        _meta_base = {}
+
+    # Helper: compute line number for a given offset
+    def _line_no_at(pos: int) -> int:
+        return content.count("\n", 0, max(0, pos)) + 1
+
+    # Helper: check placeholder words in a text window
+    _placeholder_re = re.compile(r"\b(example|sample|dummy|placeholder|your|xxxx+|test|mock|fake|invalid|notreal|redacted|todo|fixme)\b", re.I)
+
+    def _has_placeholder(around: str) -> bool:
+        return bool(_placeholder_re.search(around))
+
+    # extract keys from content (with positions)
     key_pattern = trim(key_pattern)
+    if not key_pattern:
+        return []
+
+    # When endpoint_pattern is provided, do near-proximity pairing to avoid cross-file mismatches
+    endpoint_pattern = trim(endpoint_pattern)
+
+    candidates: List[Service] = []
+
+    if endpoint_pattern:
+        try:
+            key_re = re.compile(key_pattern, flags=re.I | re.S)
+        except Exception:
+            key_re = re.compile(key_pattern)
+        try:
+            ep_re = re.compile(endpoint_pattern, flags=re.I | re.S)
+        except Exception:
+            ep_re = re.compile(endpoint_pattern)
+
+        # Simple placeholder filter to drop obvious fake/template keys
+        def _is_placeholder(s: str) -> bool:
+            try:
+                t = str(s or "").strip().lower()
+                if not t:
+                    return True
+                bad_sub = ("your", "example", "sample", "test", "mock", "dummy", "xxxx", "xxxxx", "replace")
+                if any(x in t for x in bad_sub):
+                    return True
+                # common forms like sk-ant-your-...-here or api_key_here
+                if re.findall(r"(your.*key|key.*here|api[_-]?key.*here|xxx+|^sk-[-_x]+$)", t, flags=re.I):
+                    return True
+                return False
+            except Exception:
+                return False
+
+        key_matches: List[Tuple[str, int, int]] = []  # (value, start, end)
+        for m in key_re.finditer(content):
+            val = m.group(1) if m.groups() else m.group(0)
+            if val:
+                v = trim(val)
+                if not _is_placeholder(v):
+                    key_matches.append((v, m.start(), m.end()))
+
+        ep_matches: List[Tuple[str, int, int]] = []
+        for m in ep_re.finditer(content):
+            val = m.group(1) if m.groups() else m.group(0)
+            if val:
+                v = trim(val)
+                if not _is_placeholder(v):
+                    ep_matches.append((v, m.start(), m.end()))
+
+        if not key_matches or not ep_matches:
+            # Emit half-candidates for repo-aware cross-file pairing
+            half_candidates: List[Service] = []
+            # Optional address/model extraction to carry along
+            address_pattern = trim(address_pattern)
+            addresses = extract(text=content, regex=address_pattern) if address_pattern else [""]
+            if not addresses:
+                addresses = [""]
+            model_pattern = trim(model_pattern)
+            models = extract(text=content, regex=model_pattern) if model_pattern else [""]
+            if not models:
+                models = [""]
+
+            if key_matches and not ep_matches:
+                # key-only
+                for k_val, _, _ in key_matches:
+                    for address, model in itertools.product(addresses, models):
+                        svc = Service(address=address, endpoint="", key=k_val, model=model)
+                        try:
+                            if _meta_base:
+                                svc.meta.update(_meta_base)
+                            svc.meta["pair_half"] = "key_only"
+                        except Exception:
+                            pass
+                        half_candidates.append(svc)
+            elif ep_matches and not key_matches:
+                # endpoint-only
+                for e_val, _, _ in ep_matches:
+                    for address, model in itertools.product(addresses, models):
+                        svc = Service(address=address, endpoint=e_val, key="", model=model)
+                        try:
+                            if _meta_base:
+                                svc.meta.update(_meta_base)
+                            svc.meta["pair_half"] = "endpoint_only"
+                        except Exception:
+                            pass
+                        half_candidates.append(svc)
+            return half_candidates
+
+        # Optional address/model extraction (global in file)
+        address_pattern = trim(address_pattern)
+        addresses = extract(text=content, regex=address_pattern) if address_pattern else [""]
+        if address_pattern and not addresses:
+            return []
+        if not addresses:
+            addresses = [""]
+
+        model_pattern = trim(model_pattern)
+        models = extract(text=content, regex=model_pattern) if model_pattern else [""]
+        if model_pattern and not models:
+            return []
+        if not models:
+            models = [""]
+
+        # Dynamic neighbor threshold: tighten when context is noisy/long lines
+        MAX_LINE_DISTANCE = 10
+        try:
+            # crude heuristic: if file seems long and has many comment markers, tighten
+            lines = content.splitlines()
+            n = len(lines)
+            comment_like = sum(1 for ln in lines if ln.strip().startswith(('#','//','/*','*')))
+            ratio = (comment_like / max(1, n))
+            if n > 800 or ratio > 0.25:
+                MAX_LINE_DISTANCE = 6
+        except Exception:
+            pass
+        CONTEXT_LINES = 5
+
+        # Build near-proximity pairs only (multi-tier threshold); widen progressively if过严
+        matched_any = False
+        # tier 1: tight
+        for k_val, k_s, k_e in key_matches:
+            k_ln = _line_no_at(k_s)
+            for e_val, e_s, e_e in ep_matches:
+                e_ln = _line_no_at(e_s)
+                if abs(k_ln - e_ln) <= MAX_LINE_DISTANCE:
+                    start = max(0, content.rfind("\n", 0, min(k_s, e_s)))
+                    end = content.find("\n", max(k_e, e_e))
+                    if end == -1:
+                        end = len(content)
+                    ctx = content[max(0, start):min(len(content), end)]
+                    if _has_placeholder(ctx):
+                        continue
+                    for address, model in itertools.product(addresses, models):
+                        svc = Service(address=address, endpoint=e_val, key=k_val, model=model)
+                        try:
+                            if _meta_base:
+                                svc.meta.update(_meta_base)
+                        except Exception:
+                            pass
+                        candidates.append(svc)
+                        matched_any = True
+        if matched_any:
+            return candidates
+
+        # tier 2: medium (double the distance)
+        MED_DIST = min(12, MAX_LINE_DISTANCE * 2)
+        for k_val, k_s, k_e in key_matches:
+            k_ln = _line_no_at(k_s)
+            for e_val, e_s, e_e in ep_matches:
+                e_ln = _line_no_at(e_s)
+                if abs(k_ln - e_ln) <= MED_DIST:
+                    start = max(0, content.rfind("\n", 0, min(k_s, e_s)))
+                    end = content.find("\n", max(k_e, e_e))
+                    if end == -1:
+                        end = len(content)
+                    ctx = content[max(0, start):min(len(content), end)]
+                    if _has_placeholder(ctx):
+                        continue
+                    for address, model in itertools.product(addresses, models):
+                        svc = Service(address=address, endpoint=e_val, key=k_val, model=model)
+                        try:
+                            if _meta_base:
+                                svc.meta.update(_meta_base)
+                        except Exception:
+                            pass
+                        candidates.append(svc)
+                        matched_any = True
+        if matched_any:
+            return candidates
+
+        # tier 3: same file fallback (still require both present but without line distance)
+        for k_val, _, _ in key_matches:
+            for e_val, _, _ in ep_matches:
+                for address, model in itertools.product(addresses, models):
+                    svc = Service(address=address, endpoint=e_val, key=k_val, model=model)
+                    try:
+                        if _meta_base:
+                            svc.meta.update(_meta_base)
+                    except Exception:
+                        pass
+                    candidates.append(svc)
+        return candidates
+
+    # Fallback: original wide extraction without near pairing
     keys = extract(text=content, regex=key_pattern)
     if not keys:
         return []
 
-    # extract api addresses from content
     address_pattern = trim(address_pattern)
     addresses = extract(text=content, regex=address_pattern)
     if address_pattern and not addresses:
@@ -763,25 +1132,25 @@ def collect(
     if not addresses:
         addresses.append("")
 
-    # extract api endpoints from content
-    endpoint_pattern = trim(endpoint_pattern)
-    endpoints = extract(text=content, regex=endpoint_pattern)
-    if endpoint_pattern and not endpoints:
-        return []
-    if not endpoints:
-        endpoints.append("")
-
-    # extract models from content
     model_pattern = trim(model_pattern)
     models = extract(text=content, regex=model_pattern)
+    need_model = False
     if model_pattern and not models:
-        return []
+        # Do not drop; allow half-candidate (e.g., Iflytek has key but missing APPID)
+        need_model = True
+        models = [""]
     if not models:
         models.append("")
 
-    candidates = list()
+    # endpoints (optional when not provided)
+    endpoints: List[str] = []
+    if endpoint_pattern:
+        endpoints = extract(text=content, regex=endpoint_pattern)
+        if endpoint_pattern and not endpoints:
+            return []
+    if not endpoints:
+        endpoints.append("")
 
-    # combine keys, addresses and endpoints
     for key, address, endpoint, model in itertools.product(keys, addresses, endpoints, models):
         candidates.append(Service(address=address, endpoint=endpoint, key=key, model=model))
 
@@ -791,12 +1160,24 @@ def collect(
 @handle_exceptions(default_result=[], log_level="error")
 def extract(text: str, regex: str) -> List[str]:
     """Extract strings from text using regex pattern."""
+    # Defensive type checks to avoid regex errors
+    if not isinstance(text, str) or not isinstance(regex, str):
+        return []
+
     content, pattern = trim(text), trim(regex)
     if not content or not pattern:
         return []
 
     items: set[str] = set()
-    groups = re.findall(pattern, content)
+    # Use case-insensitive and DOTALL to catch keys split by whitespace/newlines
+    try:
+        groups = re.findall(pattern, content, flags=re.I | re.S)
+    except TypeError:
+        # Pattern may already include flags; fallback to default
+        try:
+            groups = re.findall(pattern, content)
+        except Exception:
+            return []
     for x in groups:
         words: List[str] = []
         if isinstance(x, str):

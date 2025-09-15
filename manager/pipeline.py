@@ -59,8 +59,8 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
 
         self.rate_limiter = RateLimiter(config.ratelimits)
 
-        # Initialize GitHub client rate limiter
-        client.init_github_client(config.ratelimits)
+        # Bind GitHub client to shared rate limiter (unify control)
+        client.set_github_client_rate_limiter(self.rate_limiter)
 
         self.queue_manager = QueueManager(
             workspace=config.global_config.workspace,

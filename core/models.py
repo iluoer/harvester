@@ -357,12 +357,15 @@ class Service:
     # Model name for AI services
     model: str = ""
 
+    # Optional metadata for provider-specific enrichment (e.g., balances)
+    meta: Dict[str, Any] = field(default_factory=dict)
+
     def __hash__(self) -> int:
-        """Hash based on all fields for use in sets and dicts"""
+        """Hash based on core fields (meta excluded) for sets and dicts"""
         return hash((self.address, self.endpoint, self.key, self.model))
 
     def __eq__(self, other: object) -> bool:
-        """Equality comparison based on all fields"""
+        """Equality comparison based on core fields (meta excluded)"""
         if not isinstance(other, Service):
             return False
 
@@ -381,53 +384,72 @@ class Service:
         """Get unique identifier for this service"""
         return f"{self.address}:{self.endpoint}:{self.key[:8]}..."
 
-    def to_dict(self) -> Dict[str, str]:
+    def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization"""
-        return {
+        data: Dict[str, Any] = {
             "address": self.address,
             "endpoint": self.endpoint,
             "key": self.key,
             "model": self.model,
         }
+        if self.meta:
+            data["meta"] = self.meta
+        return data
 
     @classmethod
-    def from_dict(cls, data: Dict[str, str]) -> "Service":
+    def from_dict(cls, data: Dict[str, Any]) -> "Service":
         """Create Service from dictionary"""
         return cls(
             address=data.get("address", ""),
             endpoint=data.get("endpoint", ""),
             key=data.get("key", ""),
             model=data.get("model", ""),
+            meta=data.get("meta", {}),
         )
 
     def serialize(self) -> str:
-        if not self.address and not self.endpoint and not self.model:
-            return self.key
-
-        data = {}
+        """Serialize as JSON. If meta exists, merge into top-level for convenience."""
+        base: Dict[str, Any] = {
+            "key": self.key,
+        }
         if self.address:
-            data["address"] = self.address
+            base["address"] = self.address
         if self.endpoint:
-            data["endpoint"] = self.endpoint
-        if self.key:
-            data["key"] = self.key
+            base["endpoint"] = self.endpoint
         if self.model:
-            data["model"] = self.model
-
-        return "" if not data else json.dumps(data)
+            base["model"] = self.model
+        # Merge meta to top-level (keys in meta override nothing in base except by same name)
+        if self.meta:
+            for k, v in self.meta.items():
+                if k not in base:
+                    base[k] = v
+                else:
+                    # Avoid clobbering required fields
+                    base[f"meta_{k}"] = v
+        return json.dumps(base, ensure_ascii=False)
 
     @classmethod
     def deserialize(cls, text: str) -> Optional["Service"]:
         if not text:
             return None
-
         try:
             item = json.loads(text)
+            # Extract known fields, everything else goes into meta (except known keys)
+            known = {"address", "endpoint", "key", "model", "meta"}
+            meta: Dict[str, Any] = {}
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    if k not in known:
+                        meta[k] = v
+            if isinstance(item.get("meta", {}), dict):
+                # Merge explicit meta
+                meta.update(item.get("meta", {}))
             return cls(
                 address=item.get("address", ""),
                 endpoint=item.get("endpoint", ""),
                 key=item.get("key", ""),
                 model=item.get("model", ""),
+                meta=meta,
             )
         except Exception:
             return cls(key=text)

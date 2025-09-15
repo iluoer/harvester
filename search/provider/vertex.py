@@ -151,16 +151,20 @@ class VertexProvider(AIBaseProvider):
         elif code == 400:
             if re.findall(r"API_KEY_INVALID|invalid.*key", message, flags=re.I):
                 return CheckResult.fail(ErrorReason.INVALID_KEY)
+            # 400 + permission hints: 视为凭证存在但请求无权限
             elif re.findall(r"PERMISSION_DENIED|permission", message, flags=re.I):
-                return CheckResult.fail(ErrorReason.NO_ACCESS)
+                return CheckResult.success()
         elif code == 403:
+            # 配额/计费类：凭证有效但无额度
             if re.findall(r"quota|billing", message, flags=re.I):
-                return CheckResult.fail(ErrorReason.NO_QUOTA)
+                return CheckResult.success()
+            # 其他禁止：凭证有效但该操作无权限
             else:
-                return CheckResult.fail(ErrorReason.NO_ACCESS)
+                return CheckResult.success()
         elif code == 404:
+            # 模型不存在属于业务侧，token 已过鉴权
             if re.findall(r"model.*not.*found", message, flags=re.I):
-                return CheckResult.fail(ErrorReason.NO_MODEL)
+                return CheckResult.success()
 
         return super()._judge(code, message)
 

@@ -6,6 +6,7 @@ Registers all standard pipeline stages with their dependencies.
 """
 
 import math
+import threading
 import time
 from typing import List, Optional, Tuple
 
@@ -94,6 +95,35 @@ class SearchStage(BasePipelineStage):
                 results, content = self._execute_page_search(task)
                 total = 0
 
+            # Optional fallback: if API returned nothing OR error, try web session once (guarded by extras.fallback_web)
+            try:
+                should_fallback = (
+                    task.page == 1 and task.use_api and (not results) and (total == 0 or not content)
+                )
+                # Additionally fallback if client layer marked rate/abuse (401/403/429) on first page
+                # We piggyback on last log or a soft flag in content; since we don't pass error codes here,
+                # we conservatively fallback when content is empty and results empty.
+                if should_fallback:
+                    task_cfg = self.resources.task_configs.get(task.provider)
+                    fallback_enabled = bool(getattr(task_cfg, "extras", {}).get("fallback_web", False)) if task_cfg else False
+                    # Only fallback if we have a session available
+                    if fallback_enabled and self.resources.auth.get_session() is not None:
+                        logger.info(f"[{self.name}] API returned 0/empty for {task.provider}, falling back to web session once for query: {task.query}")
+                        # Execute a one-off web search for first page
+                        # Note: search_with_count returns (results, total, content)
+                        w_results, w_total, w_content = client.search_with_count(
+                            query=self._preprocess_query(task.query, False),
+                            session=self.resources.auth.get_session(),
+                            page=1,
+                            with_api=False,
+                            peer_page=WEB_RESULTS_PER_PAGE,
+                        )
+                        # If web found anything, override current variables
+                        if w_results or (isinstance(w_total, (int, float)) and w_total > 0):
+                            results, content, total = w_results, w_content, w_total
+            except Exception:
+                pass
+
             # Create output object
             output = StageOutput(task=task)
 
@@ -147,10 +177,16 @@ class SearchStage(BasePipelineStage):
         # Get auth via injected provider
         if task.use_api:
             auth_token = self.resources.auth.get_token()
+            # If token is on cooldown, skip this attempt early
+            if client.is_token_on_cooldown(auth_token):
+                return [], "", 0
         else:
             auth_token = self.resources.auth.get_session()
+            if client.is_session_on_cooldown(auth_token):
+                return [], "", 0
 
         # Execute search with count - now returns content as well
+        # search_with_count returns (results, total, content)
         results, total, content = client.search_with_count(
             query=self._preprocess_query(task.query, task.use_api),
             session=auth_token,
@@ -164,9 +200,13 @@ class SearchStage(BasePipelineStage):
     def _preprocess_query(self, query: str, use_api: bool) -> str:
         """Github Rest API search syntax don't support regex, so we need remove it if exists"""
         if use_api:
-            keyword = RefineEngine.get_instance().clean_regex(query=query)
-            if keyword:
-                query = keyword
+            # Only apply RefineEngine.clean_regex if the query contains regex patterns (starts and ends with /)
+            # For simple keyword queries, use them as-is to avoid over-processing
+            if query.strip().startswith('/') and query.strip().endswith('/'):
+                keyword = RefineEngine.get_instance().clean_regex(query=query)
+                if keyword:
+                    query = keyword
+            # For simple keyword queries like "AKID SecretKey", use them directly
 
         return query
 
@@ -178,8 +218,12 @@ class SearchStage(BasePipelineStage):
         # Get auth via injected provider
         if task.use_api:
             auth_token = self.resources.auth.get_token()
+            if client.is_token_on_cooldown(auth_token):
+                return [], ""
         else:
             auth_token = self.resources.auth.get_session()
+            if client.is_session_on_cooldown(auth_token):
+                return [], ""
 
         # Execute search - now returns content as well
         results, content = client.search_code(
@@ -213,11 +257,23 @@ class SearchStage(BasePipelineStage):
         limit = API_LIMIT if task.use_api else WEB_LIMIT
         per_page = API_RESULTS_PER_PAGE if task.use_api else WEB_RESULTS_PER_PAGE
 
-        # If needs refine query
-        if total > limit:
+        # Check per-provider extras to optionally disable refine
+        refine_enabled = True
+        try:
+            task_cfg = self.resources.task_configs.get(task.provider)
+            if task_cfg and getattr(task_cfg, 'extras', None):
+                refine_enabled = bool(task_cfg.extras.get('refine', True))
+        except Exception:
+            refine_enabled = True
+
+        # If needs refine query and refine is enabled
+        if total > limit and refine_enabled:
             # Regenerate the query with less data
             partitions = int(math.ceil(total / limit))
             queries = RefineEngine.get_instance().generate_queries(query=task.query, partitions=partitions)
+
+            # Cap refine fan-out to avoid abuse detection
+            queries = queries[:10]
 
             # Add new query tasks to output
             for query in queries:
@@ -246,7 +302,7 @@ class SearchStage(BasePipelineStage):
                 output.add_task(refined_task, PipelineStage.SEARCH.value)
 
             logger.info(
-                f"[{self.name}] generated {len(queries)} refined tasks for provider: {task.provider}, query: {task.query}"
+                f"[{self.name}] generated {len(queries)} refined tasks (capped) for provider: {task.provider}, query: {task.query}"
             )
 
         # If needs pagination and not refining
@@ -293,6 +349,16 @@ class SearchStage(BasePipelineStage):
             text=content,
         )
 
+        # Ensure provider metadata is present for cross-file pairing logic
+        try:
+            for svc in services or []:
+                if getattr(svc, 'meta', None) is None:
+                    svc.meta = {}
+                if 'provider' not in svc.meta:
+                    svc.meta['provider'] = (task.provider or '')
+        except Exception:
+            pass
+
         return services
 
 
@@ -302,8 +368,72 @@ class SearchStage(BasePipelineStage):
     produces_for=[PipelineStage.CHECK.value],
     description="Gather keys from discovered URLs",
 )
+
 class AcquisitionStage(BasePipelineStage):
     """Pipeline stage for acquiring keys from URLs with pure functional processing"""
+
+    # --- RepoPairIndex: shared across AcquisitionStage instances ---
+    _repo_pair_index = {}
+    _repo_pair_lock = threading.Lock()
+
+    @staticmethod
+    def _repo_key(meta: dict) -> Optional[tuple]:
+        try:
+            owner = (meta or {}).get("repo_owner")
+            repo = (meta or {}).get("repo_name")
+            if owner and repo:
+                return (owner, repo)
+            return None
+        except Exception:
+            return None
+
+    @classmethod
+    def _try_instant_pair(cls, svc: Service) -> Optional[Service]:
+        try:
+            meta = getattr(svc, "meta", {}) or {}
+            repo_key = cls._repo_key(meta)
+            if not repo_key:
+                return None
+            provider = (meta.get("provider") or "").lower()
+            with cls._repo_pair_lock:
+                bucket = cls._repo_pair_index.setdefault(repo_key, {"key_only": set(), "endpoint_only": set()})
+                half = meta.get("pair_half")
+                if half == "key_only":
+                    # We have key; try to find the "other half" (endpoint/appid)
+                    if bucket["endpoint_only"]:
+                        other = next(iter(bucket["endpoint_only"]))
+                        bucket["endpoint_only"].discard(other)
+                        if provider == "iflytek_speech":
+                            # 对齐存储输出，endpoint 写入 APPID
+                            return Service(address=svc.address, endpoint=other, key=svc.key, model=other, meta=meta)
+                        else:
+                            return Service(address=svc.address, endpoint=other, key=svc.key, model=svc.model, meta=meta)
+                    bucket["key_only"].add(svc.key)
+                    return None
+                elif half == "endpoint_only":
+                    # We have endpoint/appid; try to find key
+                    if bucket["key_only"]:
+                        k_val = next(iter(bucket["key_only"]))
+                        bucket["key_only"].discard(k_val)
+                        if provider == "iflytek_speech":
+                            # endpoint 与 model 同写 APPID，便于落盘
+                            appid = svc.model or svc.endpoint
+                            return Service(address=svc.address, endpoint=appid, key=k_val, model=appid, meta=meta)
+                        else:
+                            return Service(address=svc.address, endpoint=svc.endpoint, key=k_val, model=svc.model, meta=meta)
+                    # Save the "other half" value for later pairing
+                    if provider == "iflytek_speech":
+                        # APPID 可能出现在 model 或 endpoint，优先使用 model，退而取 endpoint
+                        other_val = svc.model or svc.endpoint
+                    else:
+                        other_val = svc.endpoint
+                    if other_val:
+                        bucket["endpoint_only"].add(other_val)
+                    return None
+                else:
+                    return None
+        except Exception:
+            return None
 
     def __init__(self, resources: StageResources, handler: OutputHandler, **kwargs):
         super().__init__(PipelineStage.GATHER.value, resources, handler, **kwargs)
@@ -334,16 +464,116 @@ class AcquisitionStage(BasePipelineStage):
                 model_pattern=task.model_pattern,
             )
 
+            # Stamp provider name into meta for pairing logic downstream
+            try:
+                for svc in services or []:
+                    if getattr(svc, 'meta', None) is None:
+                        svc.meta = {}
+                    if 'provider' not in svc.meta:
+                        svc.meta['provider'] = (task.provider or '')
+            except Exception:
+                pass
+
             # Create output object
             output = StageOutput(task=task)
 
-            # Create check tasks for found services
+            # Determine provider extras
+            extras = {}
+            try:
+                cfg = self.resources.task_configs.get(task.provider)
+                if cfg and getattr(cfg, 'extras', None):
+                    extras = cfg.extras
+            except Exception:
+                extras = {}
+
+            # Helper: produce repo-scoped search tasks to complete pairs
+            def _emit_repo_pair_searches(svc: Service) -> None:
+                if not isinstance(svc, Service):
+                    return
+                meta = getattr(svc, 'meta', {}) or {}
+                owner = meta.get('repo_owner')
+                repo = meta.get('repo_name')
+                if not owner or not repo:
+                    return
+                pair_half = meta.get('pair_half')
+                if not pair_half:
+                    return
+                # Cap queries per half-candidate
+                queries: List[str] = []
+                repo_scope = f"repo:{owner}/{repo}"
+                prov = (task.provider or '').lower()
+                if prov == 'tencent_asr':
+                    if pair_half == 'key_only':
+                        queries = [f"{repo_scope} AKID", f"{repo_scope} SecretId"]
+                    elif pair_half == 'endpoint_only':
+                        queries = [f"{repo_scope} SecretKey", f"{repo_scope} TENCENTCLOUD_SECRETKEY"]
+                elif prov == 'iflytek_speech':
+                    if pair_half == 'key_only':
+                        # Have API key, need APPID
+                        queries = [f"{repo_scope} X-Appid", f"{repo_scope} APPID", f"{repo_scope} XFYUN_APPID"]
+                    elif pair_half == 'endpoint_only':
+                        # Have APPID, need API key
+                        queries = [f"{repo_scope} XFYUN_API_KEY", f"{repo_scope} IFLYTEK_API_KEY", f"{repo_scope} XF_API_KEY"]
+                if not queries:
+                    return
+                # Bound the number of follow-up searches
+                queries = queries[: extras.get('repo_pair_search_cap', 2) ]
+                for q in queries:
+                    # Choose regex according to which half we are missing
+                    desired_regex = task.key_pattern or ''
+                    try:
+                        if prov == 'tencent_asr':
+                            if pair_half == 'key_only':
+                                desired_regex = task.endpoint_pattern or ''
+                            elif pair_half == 'endpoint_only':
+                                desired_regex = task.key_pattern or ''
+                        elif prov == 'iflytek_speech':
+                            if pair_half == 'key_only':
+                                desired_regex = task.model_pattern or ''  # need APPID
+                            elif pair_half == 'endpoint_only':
+                                desired_regex = task.key_pattern or ''
+                    except Exception:
+                        desired_regex = task.key_pattern or ''
+
+                    st = TaskFactory.create_search_task(
+                        provider=task.provider,
+                        query=q,
+                        regex=desired_regex,
+                        page=1,
+                        use_api=True,
+                        address_pattern=task.address_pattern or '',
+                        endpoint_pattern=task.endpoint_pattern or '',
+                        model_pattern=task.model_pattern or '',
+                    )
+                    output.add_task(st, PipelineStage.SEARCH.value)
+
+            # Create check tasks for found services; defer half-candidates to repo pairing
             if services:
+                complete: List[Service] = []
                 for service in services:
-                    check_task = TaskFactory.create_check_task(task.provider, service)
+                    half = False
+                    try:
+                        meta = getattr(service, 'meta', {}) or {}
+                        if meta.get('pair_half'):
+                            half = True
+                    except Exception:
+                        half = False
+                    if half and extras.get('cross_pair', True):
+                        # First try instant cross-file pairing via RepoPairIndex
+                        paired = AcquisitionStage._try_instant_pair(service)
+                        if paired:
+                            complete.append(paired)
+                        else:
+                            _emit_repo_pair_searches(service)
+                        # Do not send original half-candidate to check yet
+                        continue
+                    complete.append(service)
+
+                for svc in complete:
+                    check_task = TaskFactory.create_check_task(task.provider, svc)
                     output.add_task(check_task, PipelineStage.CHECK.value)
 
-                # Add material keys to be saved
+                # Add material keys to be saved (include both complete and half-candidates for traceability)
                 output.add_result(task.provider, ResultType.MATERIAL.value, services)
 
             # Add the processed link to be saved
@@ -424,9 +654,59 @@ class CheckStage(BasePipelineStage):
 
             # Handle result based on availability
             if result.available:
+                # Enrich service with optional account info (e.g., balances) before persisting
+                try:
+                    markers = provider.inspect(
+                        token=task.service.key,
+                        address=task.custom_url or task.service.address,
+                        endpoint=task.service.endpoint,
+                    )
+                    meta = {}
+                    models_list = None
+                    for m in markers or []:
+                        if isinstance(m, str) and "=" in m:
+                            k, v = m.split("=", 1)
+                            k = (k or "").strip()
+                            v = (v or "").strip()
+                            if k in ("balance", "chargeBalance", "totalBalance", "status", "paid"):
+                                if k == "paid":
+                                    meta[k] = v.lower() in ("true", "1", "yes")
+                                else:
+                                    meta[k] = v
+                            elif k == "models":
+                                try:
+                                    models_list = [x.strip() for x in v.split(",") if x.strip()]
+                                except Exception:
+                                    models_list = None
+                    if meta or models_list:
+                        # attach to service so it is serialized with the valid record
+                        try:
+                            if meta:
+                                task.service.meta.update(meta)
+                            if models_list:
+                                task.service.meta["models"] = models_list
+                        except Exception:
+                            # if meta isn't available on older Service versions, ignore
+                            pass
+                except Exception:
+                    # enrichment is best-effort; do not fail the check flow
+                    pass
+
                 # Create inspect task
                 inspect_task = TaskFactory.create_inspect_task(task.provider, task.service)
                 output.add_task(inspect_task, PipelineStage.INSPECT.value)
+
+                # For Tencent, only persist to valid when we have balance info to meet format expectation
+                if (task.provider or '').lower() == 'tencent_asr':
+                    try:
+                        meta = getattr(task.service, 'meta', {}) or {}
+                        if 'balance' not in meta:
+                            # Without balance, do not persist to valid list (treat as WAIT_CHECK)
+                            output.add_result(task.provider, ResultType.WAIT_CHECK.value, [task.service])
+                            return output
+                    except Exception:
+                        output.add_result(task.provider, ResultType.WAIT_CHECK.value, [task.service])
+                        return output
 
                 # Add valid key to be saved
                 output.add_result(task.provider, ResultType.VALID.value, [task.service])
@@ -494,17 +774,52 @@ class InspectStage(BasePipelineStage):
                 logger.error(f"[{self.name}] unknown provider: {task.provider}, type: {type(provider)}")
                 return None
 
-            # Get model list
-            models = provider.inspect(
+            # Inspect provider for markers (may include balances, paid flags, or models)
+            markers = provider.inspect(
                 token=task.service.key, address=task.service.address, endpoint=task.service.endpoint
             )
 
             # Create output object
             output = StageOutput(task=task)
 
-            # Add models to be saved
-            if models:
-                output.add_models(task.provider, task.service.key, models)
+            # Parse markers into meta/models like in CHECK stage
+            meta: Dict[str, Any] = {}
+            models_list = None
+            try:
+                for m in markers or []:
+                    if isinstance(m, str) and "=" in m:
+                        k, v = m.split("=", 1)
+                        k = (k or "").strip()
+                        v = (v or "").strip()
+                        if k in ("balance", "chargeBalance", "totalBalance", "status", "paid"):
+                            if k == "paid":
+                                meta[k] = v.lower() in ("true", "1", "yes")
+                            else:
+                                meta[k] = v
+                        elif k == "models":
+                            try:
+                                models_list = [x.strip() for x in v.split(",") if x.strip()]
+                            except Exception:
+                                models_list = None
+                if meta:
+                    try:
+                        task.service.meta.update(meta)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Save models list if any
+            if models_list:
+                output.add_models(task.provider, task.service.key, models_list)
+
+            # For Tencent, persist to valid when balance info is available (align with format requirement)
+            if (task.provider or '').lower() == 'tencent_asr':
+                try:
+                    if 'balance' in (task.service.meta or {}):
+                        output.add_result(task.provider, ResultType.VALID.value, [task.service])
+                except Exception:
+                    pass
 
             return output
 

@@ -113,20 +113,22 @@ class OpenAILikeProvider(AIBaseProvider):
         message = trim(message)
         if message:
             if code == 403:
+                # Permission/forbidden => token存在但无访问该模型/动作权限，视为"凭证有效"
+                if re.findall(r"unauthorized|已被封禁|forbidden|permission", message, flags=re.I):
+                    return CheckResult.success()
+                # 模型不存在，确属业务侧：也可作为"有效"信号（token已通过鉴权）
                 if re.findall(r"model_not_found", message, flags=re.I):
-                    return CheckResult.fail(ErrorReason.NO_MODEL)
-                elif re.findall(r"unauthorized|已被封禁", message, flags=re.I):
-                    return CheckResult.fail(ErrorReason.INVALID_KEY)
-                elif re.findall(r"unsupported_country_region_territory|该令牌无权访问模型", message, flags=re.I):
-                    return CheckResult.fail(ErrorReason.NO_ACCESS)
-                elif re.findall(
-                    r"exceeded_current_quota_error|insufficient_user_quota|(额度|余额)(不足|过低)", message, flags=re.I
-                ):
-                    return CheckResult.fail(ErrorReason.NO_QUOTA)
+                    return CheckResult.success()
+                # 区域/权限不匹配仍视为有效
+                if re.findall(r"unsupported_country_region_territory|该令牌无权访问模型", message, flags=re.I):
+                    return CheckResult.success()
+                # 配额不足/余额不足：凭证有效但无额度
+                if re.findall(r"exceeded_current_quota_error|insufficient_user_quota|(额度|余额)(不足|过低)", message, flags=re.I):
+                    return CheckResult.success()
             elif code == 429:
                 if re.findall(r"insufficient_quota|billing_not_active|欠费|请充值|recharge", message, flags=re.I):
-                    return CheckResult.fail(ErrorReason.NO_QUOTA)
-                elif re.findall(r"rate_limit_exceeded", message, flags=re.I):
+                    return CheckResult.success()
+                if re.findall(r"rate_limit_exceeded", message, flags=re.I):
                     return CheckResult.fail(ErrorReason.RATE_LIMITED)
             elif code == 503 and re.findall(r"无可用渠道", message, flags=re.I):
                 return CheckResult.fail(ErrorReason.NO_MODEL)

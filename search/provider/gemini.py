@@ -35,7 +35,8 @@ class GeminiProvider(AIBaseProvider):
                 "base_url": "https://generativelanguage.googleapis.com",
                 "completion_path": "/v1beta/models",
                 "model_path": "/v1beta/models",
-                "default_model": "gemini-2.5-pro",
+                # Default to a permissive model for generateContent token test
+                "default_model": "gemini-1.5-flash",
             },
         )
 
@@ -93,8 +94,9 @@ class GeminiProvider(AIBaseProvider):
 
         try:
             data = json.loads(content)
-            models = data.get("models", [])
-            return [x.get("name", "").removeprefix("models/") for x in models]
+            models = [x.get("name", "").removeprefix("models/") for x in data.get("models", [])]
+            models = [m for m in models if m]
+            return ["models=" + ",".join(models)] if models else []
         except:
             logger.error(f"Failed to parse models from response: {content}")
             return []

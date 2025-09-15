@@ -10,8 +10,8 @@ language processing, and search result limits.
 from typing import List, Set
 
 # Search result limits
-API_MAX_PAGES: int = 10
-WEB_MAX_PAGES: int = 5
+API_MAX_PAGES: int = 20
+WEB_MAX_PAGES: int = 25
 API_RESULTS_PER_PAGE: int = 100
 WEB_RESULTS_PER_PAGE: int = 20
 API_LIMIT: int = API_MAX_PAGES * API_RESULTS_PER_PAGE

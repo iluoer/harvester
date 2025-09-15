@@ -9,6 +9,7 @@ different persistence approaches: simple file-based and shard-based storage.
 
 import json
 import os
+import shutil
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -16,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from state.models import PersistenceMetrics
 from tools.logger import get_logger
+from core.models import Service
 
 from .atomic import AtomicFileWriter
 from .shard import NDJSONShardWriter
@@ -92,13 +94,69 @@ class SimpleFileStrategy(PersistenceStrategy):
             return
 
         try:
-            # Convert items to text lines
+            # Convert items to text lines with minimal fields
             lines = []
             for item in items:
-                if hasattr(item, "serialize"):
-                    lines.append(item.serialize())
+                if isinstance(item, Service):
+                    # Build minimal JSON: only endpoint, key, and selected meta
+                    base: Dict[str, Any] = {}
+                    if item.endpoint:
+                        base["endpoint"] = item.endpoint
+                    if item.key:
+                        base["key"] = item.key
+                    # paid/balance
+                    try:
+                        if isinstance(item.meta, dict):
+                            if "paid" in item.meta:
+                                base["paid"] = bool(item.meta["paid"]) if not isinstance(item.meta["paid"], bool) else item.meta["paid"]
+                            if "balance" in item.meta:
+                                bal = item.meta["balance"]
+                                bal_val: float | None = None
+                                try:
+                                    if isinstance(bal, (int, float)):
+                                        bal_val = float(bal)
+                                    elif isinstance(bal, str) and bal.strip().lstrip("-+").isdigit():
+                                        bal_val = float(int(bal.strip()))
+                                except Exception:
+                                    bal_val = None
+                                if bal_val is not None:
+                                    # Convert cents to yuan, 2 decimals
+                                    base["balance"] = round(bal_val / 100.0, 2)
+                                else:
+                                    # If already looks like yuan (float string), try to format
+                                    try:
+                                        base["balance"] = round(float(bal), 2)
+                                    except Exception:
+                                        base["balance"] = bal
+                    except Exception:
+                        pass
+                    lines.append(json.dumps(base, ensure_ascii=False))
+                elif hasattr(item, "serialize"):
+                    # Fallback: parse serialized if possible and strip extras
+                    try:
+                        data = json.loads(item.serialize())
+                        minimal = {}
+                        if isinstance(data, dict):
+                            for k in ("endpoint", "key", "paid", "balance"):
+                                if k in data and data[k] is not None and data[k] != "":
+                                    minimal[k] = data[k]
+                        # Normalize balance if needed
+                        if "balance" in minimal and not isinstance(minimal["balance"], (int, float)):
+                            try:
+                                sval = str(minimal["balance"]).strip()
+                                if sval.lstrip("-+").isdigit():
+                                    minimal["balance"] = round(int(sval) / 100.0, 2)
+                                else:
+                                    minimal["balance"] = round(float(sval), 2)
+                            except Exception:
+                                pass
+                        lines.append(json.dumps(minimal or data, ensure_ascii=False))
+                    except Exception:
+                        lines.append(str(item))
                 else:
                     lines.append(str(item))
+
+            # No implicit .bak creation to keep provider folders clean (per product decision)
 
             # Write to file atomically
             AtomicFileWriter.append_atomic(filepath, lines)
@@ -147,17 +205,39 @@ class ShardStrategy(PersistenceStrategy):
             return
 
         try:
-            # Convert items to NDJSON records
-            records = []
+            # Convert items to NDJSON records (minimal fields for key files)
+            records: List[Dict[str, Any]] = []
+            minimal_types = {"valid", "invalid", "no_quota", "wait_check"}
             for item in items:
-                if hasattr(item, "serialize"):
-                    serialized = item.serialize()
+                if isinstance(item, Service):
+                    if result_type in minimal_types:
+                        rec: Dict[str, Any] = {"key": item.key}
+                        if item.endpoint:
+                            rec["endpoint"] = item.endpoint
+                        if item.address:
+                            rec["address"] = item.address
+                        if item.model:
+                            rec["model"] = item.model
+                        records.append(rec)
+                    else:
+                        # Keep full serialize for non-key result types
+                        try:
+                            records.append(json.loads(item.serialize()))
+                        except Exception:
+                            records.append({"value": item.serialize()})
+                elif hasattr(item, "serialize"):
                     try:
-                        # Try to parse as JSON for structured storage
-                        records.append(json.loads(serialized))
+                        data = json.loads(item.serialize())
+                        if result_type in minimal_types and isinstance(data, dict):
+                            rec: Dict[str, Any] = {}
+                            for k in ("key", "endpoint", "address", "model"):
+                                if k in data and data[k]:
+                                    rec[k] = data[k]
+                            records.append(rec or data)
+                        else:
+                            records.append(data)
                     except Exception:
-                        # Fallback to string envelope
-                        records.append({"value": serialized})
+                        records.append({"value": str(item)})
                 else:
                     records.append({"value": str(item)})
 

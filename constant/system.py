@@ -43,12 +43,12 @@ DEFAULT_RETRIES: int = 3
 DEFAULT_TIMEOUT: int = 30
 
 # Search and API specific timeouts
-GITHUB_API_TIMEOUT: int = 30
-GITHUB_API_INTERVAL: int = 2
+GITHUB_API_TIMEOUT: int = 60  # Increased from 30 to 60
+GITHUB_API_INTERVAL: int = 3  # Increased from 2 to 3
 GITHUB_API_RATE_LIMIT_BACKOFF: int = 60  # 1 minute
-GITHUB_WEB_COUNT_DELAY_MAX: float = 2.0  # Random delay up to 2 seconds
-CHAT_RETRY_INTERVAL: int = 1
-COLLECT_RETRY_INTERVAL: int = 1
+GITHUB_WEB_COUNT_DELAY_MAX: float = 3.0  # Increased from 2.0 to 3.0
+CHAT_RETRY_INTERVAL: int = 2  # Increased from 1 to 2
+COLLECT_RETRY_INTERVAL: int = 2  # Increased from 1 to 2
 
 # Signal handling timeouts
 FORCE_EXIT_GRACE_PERIOD: float = 5.0  # Time to wait for second Ctrl+C

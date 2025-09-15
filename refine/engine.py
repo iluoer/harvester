@@ -6,6 +6,7 @@ Main regex engine interface for pattern analysis and query generation.
 
 import re
 import threading
+import random
 from typing import List, Optional
 
 from constant.search import ALLOWED_OPERATORS, POPULAR_LANGUAGES, SIZE_RANGES
@@ -193,7 +194,10 @@ class RefineEngine:
                     candidates.add(result)
 
         conditions = list(candidates)
-        logger.debug(f"Generated {len(conditions)} queries from query: {query}, partitions: {partitions}")
+        # Cap fan-out to reduce 403/abuse
+        if len(conditions) > 10:
+            conditions = conditions[:10]
+        logger.debug(f"Generated {len(conditions)} (capped) queries from query: {query}, partitions: {partitions}")
 
         return conditions
 
@@ -262,7 +266,10 @@ class RefineEngine:
             return [query]
 
     def _divide_with_language(self, query: str) -> List[str]:
-        """Generate refined queries with adaptive refinement language level."""
+        """Generate refined queries with adaptive refinement language level.
+
+        To mitigate GitHub abuse detection, we randomize and cap language fan-out.
+        """
         base = query.strip() if query else ""
         if not base:
             logger.debug("No query provided for language refinement")
@@ -271,14 +278,16 @@ class RefineEngine:
         queries = set()
         if not re.match(r" language:[a-zA-Z0-9#]+ ", base, flags=re.I):
             # Language-based refinement
-            for lang in POPULAR_LANGUAGES:
+            langs = list(POPULAR_LANGUAGES)
+            random.shuffle(langs)
+            for lang in langs[:2]:  # at most 2 languages per refinement
                 queries.add(f"{base} language:{lang}")
         elif not re.match(r" size:[a-zA-Z0-9#=<>.]+ ", base, flags=re.I):
-            # Sise-based refinement
-            for size in SIZE_RANGES:
+            # Size-based refinement
+            for size in SIZE_RANGES[:2]:  # at most 2 size buckets
                 queries.add(f"{base} size:{size}")
         else:
-            logger.debug("Cannot refine with language or sie refinement due to existing refinement criteria")
+            logger.debug("Cannot refine with language or size refinement due to existing refinement criteria")
             queries.add(base)
 
         return list(queries)
