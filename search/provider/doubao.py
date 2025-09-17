@@ -36,9 +36,21 @@ class DoubaoProvider(OpenAILikeProvider):
         super().__init__(conditions=conditions, **kwargs)
 
     def _judge(self, code: int, message: str) -> CheckResult:
-        """Judge Doubao API response."""
+        """Judge Doubao API response.
+
+        Doubao often returns 404 when the provided model/endpoint does not exist
+        or is not accessible (e.g., InvalidEndpointOrModel.NotFound). This does
+        NOT necessarily mean the token is invalid — the request may have passed
+        auth but failed business-level lookup. We therefore treat specific 404s
+        as "key valid" to avoid false negatives when endpoint/model is missing.
+        """
         if code == 404:
-            return CheckResult.fail(ErrorReason.INVALID_KEY)
+            msg = (message or "").lower()
+            # Treat endpoint/model not found as valid token (authorization succeeded)
+            if "invalidendpointormodel.notfound" in msg or "model" in msg and "not exist" in msg:
+                return CheckResult.success()
+            # Otherwise, keep it as no access instead of invalid key
+            return CheckResult.fail(ErrorReason.NO_ACCESS)
 
         return super()._judge(code, message)
 

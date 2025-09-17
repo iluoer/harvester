@@ -19,7 +19,7 @@ from core.models import CheckResult, Condition
 from tools.coordinator import get_user_agent
 from tools.utils import handle_exceptions, trim
 
-from ..client import http_get
+from ..client import http_get, chat
 from .base import AIBaseProvider
 from .registry import register_provider
 
@@ -113,21 +113,24 @@ class OpenAILikeProvider(AIBaseProvider):
         message = trim(message)
         if message:
             if code == 403:
-                # Permission/forbidden => token存在但无访问该模型/动作权限，视为"凭证有效"
+                # 余额/欠费：标记 NO_QUOTA（覆盖 Doubao 的 AccountOverdueError 等）
+                if re.findall(r"AccountOverdueError|overdue\s+balance|欠费|余额不足|need\s*recharge", message, flags=re.I):
+                    return CheckResult.fail(ErrorReason.NO_QUOTA)
+                # 权限不足/被禁止：视为存在键但不可用，标记 NO_ACCESS
                 if re.findall(r"unauthorized|已被封禁|forbidden|permission", message, flags=re.I):
-                    return CheckResult.success()
-                # 模型不存在，确属业务侧：也可作为"有效"信号（token已通过鉴权）
+                    return CheckResult.fail(ErrorReason.NO_ACCESS)
+                # 模型不存在：标记 NO_MODEL
                 if re.findall(r"model_not_found", message, flags=re.I):
-                    return CheckResult.success()
-                # 区域/权限不匹配仍视为有效
+                    return CheckResult.fail(ErrorReason.NO_MODEL)
+                # 区域/权限不匹配：标记 NO_ACCESS
                 if re.findall(r"unsupported_country_region_territory|该令牌无权访问模型", message, flags=re.I):
-                    return CheckResult.success()
-                # 配额不足/余额不足：凭证有效但无额度
-                if re.findall(r"exceeded_current_quota_error|insufficient_user_quota|(额度|余额)(不足|过低)", message, flags=re.I):
-                    return CheckResult.success()
+                    return CheckResult.fail(ErrorReason.NO_ACCESS)
+                # 配额/额度限制：标记 NO_QUOTA
+                if re.findall(r"exceeded_current_quota_error|insufficient_user_quota|insufficient_quota", message, flags=re.I):
+                    return CheckResult.fail(ErrorReason.NO_QUOTA)
             elif code == 429:
                 if re.findall(r"insufficient_quota|billing_not_active|欠费|请充值|recharge", message, flags=re.I):
-                    return CheckResult.success()
+                    return CheckResult.fail(ErrorReason.NO_QUOTA)
                 if re.findall(r"rate_limit_exceeded", message, flags=re.I):
                     return CheckResult.fail(ErrorReason.RATE_LIMITED)
             elif code == 503 and re.findall(r"无可用渠道", message, flags=re.I):
@@ -148,6 +151,39 @@ class OpenAILikeProvider(AIBaseProvider):
 
         result = json.loads(content)
         return [trim(x.get("id", "")) for x in result.get("data", [])]
+
+    def check(self, token: str, address: str = "", endpoint: str = "", model: str = "") -> CheckResult:
+        """Override to choose a sane URL.
+
+        - If an address was extracted but its host does not match our base_url host, ignore it
+          and use base_url + completion_path to avoid malformed/foreign URLs causing 4xx.
+        - Otherwise, use the provided address.
+        """
+        # Determine candidate URL
+        base = trim(self._base_url)
+        path = trim(self.completion_path)
+        addr = trim(address)
+        url = ""
+        try:
+            if addr and addr.lower().startswith(("http://", "https://")):
+                base_host = urllib.parse.urlparse(base).netloc if base else ""
+                addr_host = urllib.parse.urlparse(addr).netloc
+                if base_host and addr_host and base_host not in addr_host:
+                    # Host mismatch -> fallback to base
+                    url = urllib.parse.urljoin(base, path)
+                else:
+                    url = addr
+            else:
+                url = urllib.parse.urljoin(base, path)
+        except Exception:
+            url = urllib.parse.urljoin(base, path)
+
+        headers = self._get_headers(token=token)
+        if not headers:
+            return CheckResult.fail(ErrorReason.BAD_REQUEST)
+        m = trim(model) or self._default_model
+        code, message = chat(url=url, headers=headers, model=m)
+        return self._judge(code=code, message=message)
 
     def inspect(self, token: str, address: str = "", endpoint: str = "") -> List[str]:
         """List available models from OpenAI-like API."""

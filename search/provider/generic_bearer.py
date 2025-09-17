@@ -109,8 +109,13 @@ class GenericBearerTokenProvider(AIBaseProvider):
         # Treat clear auth failures as invalid
         if code == 401:
             return CheckResult.fail(ErrorReason.INVALID_KEY)
-        # Some providers return 403 for disabled key or lack of scope; treat as invalid
+        # Distinguish 403 cases using message when possible
         if code == 403:
+            m = (message or "").lower()
+            if any(x in m for x in ["insufficient quota", "insufficient_quota", "billing", "欠费", "余额不足", "overdue", "quota"]):
+                return CheckResult.fail(ErrorReason.NO_QUOTA)
+            if any(x in m for x in ["forbidden", "not authorized", "permission", "no access"]):
+                return CheckResult.fail(ErrorReason.NO_ACCESS)
             return CheckResult.fail(ErrorReason.INVALID_KEY)
         # Explicit no-quota semantics
         if code == 402:
@@ -155,7 +160,11 @@ class GenericBearerTokenProvider(AIBaseProvider):
                     last = result
             except urllib.error.HTTPError as e:
                 code = e.code
-                result = self._judge(code=code, message=str(e.reason))
+                try:
+                    body = e.read().decode("utf-8", "ignore")
+                except Exception:
+                    body = str(e.reason)
+                result = self._judge(code=code, message=body)
                 last = result
             except Exception as e:
                 logger.warning(f"Generic bearer check error for {u}: {e}")

