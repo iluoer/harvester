@@ -97,23 +97,14 @@ class RefineEngine:
             return None
 
         # For simple /pattern/ format, use direct extraction
-        if query.startswith("/") and query.count("/") >= 2:
-            # Find the closing slash, accounting for escaped slashes
-            i = 1  # Start after the opening slash
-            while i < len(query):
-                if query[i] == "/":
-                    # Check if this slash is escaped
-                    escape_count = 0
-                    j = i - 1
-                    while j >= 0 and query[j] == "\\":
-                        escape_count += 1
-                        j -= 1
+        if query.startswith("/") and query.endswith("/"):
+            # Extract the full pattern between the first and last slash
+            return query[1:-1]
 
-                    # If even number of backslashes (including 0), slash is not escaped
-                    if escape_count % 2 == 0:
-                        # Found the closing slash
-                        return query[1:i]
-                i += 1
+        # Check if query contains regex-like patterns (character classes, quantifiers, etc.)
+        # If so, treat the entire query as a regex pattern
+        if re.search(r"[\[\]{}+*?\\]", query):
+            return query
 
         # Look for patterns that are likely regex (contain character classes, quantifiers, etc.)
         patterns = list(re.finditer(r"/([^/]*[\[\]{}+*?\\][^/]*)/", query))
@@ -253,7 +244,12 @@ class RefineEngine:
             queries = []
             for item in refined_patterns:
                 # Replace the original pattern with the refined pattern in the original query
-                text = query.replace(f"/{pattern}/", f"/{item}/")
+                if query.startswith("/") and query.endswith("/"):
+                    # Handle /pattern/ format
+                    text = query.replace(f"/{pattern}/", f"/{item}/")
+                else:
+                    # Handle direct pattern format
+                    text = query.replace(pattern, item)
                 queries.append(text)
 
             logger.info(

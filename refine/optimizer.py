@@ -148,19 +148,17 @@ class EnumerationOptimizer(IEnumerationOptimizer):
                 # Prioritize single-segment strategies over multi-segment ones
                 single = [s for s in suitable if len(s.segments) == 1]
                 if single:
-                    # Among single-segment strategies, prefer highest value segment
-                    best = max(single, key=lambda s: s.segments[0].value if s.segments else 0)
+                    best = self._select_strategy_with_min_depth(single, partitions)
                 else:
                     best = self._select_strategy_with_min_depth(suitable, partitions)
                 return best, True
 
             # If no suitable strategy found, return the one that generates most queries
             if all_strats:
-                # Prioritize single-segment strategies with highest value
+                # Prioritize single-segment strategies
                 single = [s for s in all_strats if len(s.segments) == 1]
                 if single:
-                    # Select single-segment strategy with highest segment value
-                    best = max(single, key=lambda s: s.segments[0].value if s.segments else 0)
+                    best = max(single, key=lambda s: s.queries)
                 else:
                     best = max(all_strats, key=lambda s: s.queries)
                 return best, False
@@ -217,7 +215,18 @@ class EnumerationOptimizer(IEnumerationOptimizer):
         for segment in segments_to_enum:
             charset_size = len(segment.charset)
             if charset_size > 0:
-                segment_queries = charset_size**depth
+                # Key fix: depth cannot exceed segment's actual enumerable length
+                # For \d (max_length=1), max depth is 1
+                # For [a-zA-Z0-9]+ (max_length=large), can have larger depth
+                effective_depth = min(depth, segment.max_length)
+
+                # If segment's max length is 1 (like \d), can only enumerate 1 layer
+                if segment.max_length == 1:
+                    segment_queries = charset_size  # Only charset_size possible values
+                else:
+                    # For variable length segments (like +, *, {n,m}), can enumerate multiple layers
+                    segment_queries = charset_size**effective_depth
+
                 total_queries *= segment_queries
                 total_value += segment.value
 
@@ -295,6 +304,12 @@ class EnumerationOptimizer(IEnumerationOptimizer):
             excess = strategy.queries - partitions
             context = calc_context_length(strategy, max(1, int(math.ceil(depth))))
 
+            # Calculate segment value for tie-breaking
+            segment_value = 0.0
+            if strategy.segments:
+                for segment in strategy.segments:
+                    segment_value += getattr(segment, "value", 0.0)
+
             # Find immediate preceding fixed segment length for tie-breaking
             before = 0
             if strategy.segments:
@@ -308,8 +323,8 @@ class EnumerationOptimizer(IEnumerationOptimizer):
                     else:
                         break
 
-            # Prefer shorter segments, longer context, longer immediate before
-            return (length, -context, -before, depth, excess)
+            # Prefer higher segment value first, then shorter segments, longer context, etc.
+            return (-segment_value, length, -context, -before, depth, excess)
 
         suitable = [s for s in strategies if s.queries >= partitions]
         if suitable:
@@ -535,32 +550,50 @@ class EnumerationOptimizer(IEnumerationOptimizer):
         """Calculate priority multiplier based on segment characteristics."""
         factor = 1.0
 
-        # Quantifier-based priority boost (stronger preference for specific ranges)
+        # Quantifier-based priority boost
         if segment.has_range():
             factor *= 3.0  # {8,12} - highest priority
+        elif segment.is_specific():
+            # Fixed length segments are excellent for enumeration
+            if segment.min_length >= 16:
+                factor *= 4.0  # {16} - very high priority for long fixed segments
+            elif segment.min_length >= 8:
+                factor *= 3.5  # {8} - high priority for medium fixed segments
+            else:
+                factor *= 2.5  # {1-7} - good priority for short fixed segments
         elif segment.has_min():
-            # Check if it's a meaningful minimum (>=8 is good for tokens)
+            # Open-ended segments are less ideal for enumeration
             if segment.min_length >= 8:
-                factor *= 2.5  # {8,} with meaningful minimum
+                factor *= 2.0  # {8,} - decent priority
             else:
                 factor *= 1.5  # {1,} or + - lower priority
-        elif segment.is_specific():
-            factor *= 2.0  # {8} - good priority
 
-        # Character class type adjustment
+        # Additional boost for longer minimum lengths
+        if segment.min_length >= 16:
+            factor *= 1.5  # Extra boost for very long segments
+        elif segment.min_length >= 8:
+            factor *= 1.2  # Small boost for long segments
+
+        # Character class type adjustment - this is crucial for correct selection
         if segment.is_positive_class():
-            factor *= 1.2
+            # Positive classes like [a-zA-Z0-9]+ are much better for enumeration
+            factor *= 3.0  # Strong boost for positive classes
         else:
-            factor *= 0.7  # Stronger penalty for converted negated classes
+            # Negative classes like [^\s\/]+ are poor for enumeration
+            factor *= 0.2  # Strong penalty for negative classes
 
-        # Character set size adjustment (prefer smaller, more specific sets)
+        # Character set size adjustment - prefer optimal enumeration sizes
         charset_size = len(segment.charset)
-        if charset_size <= 64:  # [a-zA-Z0-9_-] = 64 chars
-            factor *= 1.3
-        elif charset_size <= 80:
-            factor *= 1.0
-        else:
-            factor *= 0.8  # Penalty for large character sets
+        if 50 <= charset_size <= 70:  # [a-zA-Z0-9] = 62 chars - optimal range
+            factor *= 2.0  # Strong boost for optimal enumeration size
+        elif 30 <= charset_size < 50:
+            factor *= 1.5  # Good size
+        elif 10 <= charset_size < 30:
+            factor *= 1.2  # Decent size
+        elif charset_size < 10:  # \d = 10 chars
+            factor *= 0.8  # Small charset, limited enumeration potential
+        else:  # Very large charset (like negated classes)
+            factor *= 0.3  # Strong penalty for very large charsets
 
         return factor
 

@@ -94,37 +94,41 @@ class QueryGenerator(IQueryGenerator):
         if not segments or target_queries <= 1:
             return 1
 
-        # For multiple segments, we need to calculate the depth such that
-        # the total combinations from all segments >= target_queries
-        # Each segment contributes charset_size^depth combinations
-        # Total combinations = sum(charset_size^depth for each segment)
+        # Calculate the maximum possible depth for each segment
+        max_depths = []
+        for segment in segments:
+            # For segments with max_length=1 (like \d), max depth is 1
+            # For segments with larger max_length (like [a-zA-Z0-9]+), can be larger
+            if segment.max_length == 1:
+                max_depth = 1
+            elif segment.max_length == float("inf"):
+                max_depth = self.max_depth
+            else:
+                max_depth = min(int(segment.max_length), self.max_depth)
+            max_depths.append(max_depth)
 
-        # Find the minimum effective charset size to use as base
-        min_charset_size = min(
-            len(segment.effective_charset) for segment in segments if len(segment.effective_charset) > 0
-        )
+        # Find the minimum depth that can satisfy the target
+        for depth in range(1, max(max_depths) + 1):
+            total_queries = 0
+            for i, segment in enumerate(segments):
+                charset_size = len(segment.effective_charset) if segment.effective_charset else len(segment.charset)
+                if charset_size > 0:
+                    # Use the minimum of calculated depth and segment's max depth
+                    effective_depth = min(depth, max_depths[i])
+                    segment_queries = charset_size**effective_depth
+                    total_queries += segment_queries
 
-        if min_charset_size <= 1:
-            return 1
+            if total_queries >= target_queries:
+                logger.debug(
+                    f"Calculated min depth {depth} for target {target_queries} queries "
+                    f"with {len(segments)} segments, total_queries={total_queries}"
+                )
+                return depth
 
-        # Calculate depth needed: min_charset_size^depth * num_segments >= target_queries
-        # Solve for depth: depth >= log(target_queries / num_segments) / log(min_charset_size)
-        required_per_segment = target_queries / len(segments)
-
-        if required_per_segment <= 1:
-            return 1
-
-        min_depth = math.ceil(math.log(required_per_segment) / math.log(min_charset_size))
-
-        # Ensure depth is reasonable (between 1 and max_depth)
-        min_depth = max(1, min(min_depth, self.max_depth))
-
-        logger.debug(
-            f"Calculated min depth {min_depth} for target {target_queries} queries "
-            f"with {len(segments)} segments, min_charset_size={min_charset_size}"
-        )
-
-        return min_depth
+        # If can't satisfy target, return maximum possible depth
+        result = max(max_depths) if max_depths else 1
+        logger.debug(f"Cannot satisfy target {target_queries}, using max depth {result}")
+        return result
 
     def _generate_queries_for_single_part(
         self, segments: List[Segment], target: CharClassSegment, depth: int = -1
@@ -226,10 +230,12 @@ class QueryGenerator(IQueryGenerator):
             if not charset:
                 return [""]
 
-            # Generate combinations with specified depth
+            # Generate combinations with specified depth, escaping special characters
             combinations = []
             for combo in itertools.product(charset, repeat=depth):
-                combinations.append("".join(combo))
+                combo_str = "".join(combo)
+                escaped_combo = self._escape_regex_chars(combo_str)
+                combinations.append(escaped_combo)
 
             logger.info(f"Generated {len(combinations)} combinations for depth {depth}")
             return combinations
@@ -240,14 +246,29 @@ class QueryGenerator(IQueryGenerator):
             if optimal_depth == 0:
                 return [""]
 
-            # Generate combinations
+            # Generate combinations, escaping special characters
             combinations = []
             for combo in itertools.product(charset, repeat=optimal_depth):
-                combinations.append("".join(combo))
+                combo_str = "".join(combo)
+                escaped_combo = self._escape_regex_chars(combo_str)
+                combinations.append(escaped_combo)
 
             logger.info(f"Generated {len(combinations)} combinations for depth {optimal_depth}")
 
             return combinations
+
+    def _escape_regex_chars(self, combination: str) -> str:
+        """Escape special regex characters in combination to ensure valid syntax."""
+        if not combination:
+            return combination
+
+        # Escape forward slashes to prevent breaking /pattern/ syntax
+        escaped = combination.replace("/", r"\/")
+
+        # Note: Other special chars like +, *, ?, etc. are typically fine in character classes
+        # and in enumerated prefixes, but we can add more escaping here if needed
+
+        return escaped
 
     def _calculate_optimal_depth(self, segment: CharClassSegment) -> int:
         """Calculate optimal enumeration depth based on mathematical analysis."""
