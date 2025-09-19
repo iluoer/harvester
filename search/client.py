@@ -977,6 +977,60 @@ def collect(
     def _has_placeholder(around: str) -> bool:
         return bool(_placeholder_re.search(around))
 
+    def _is_placeholder(s: str) -> bool:
+        try:
+            t = str(s or "").strip().lower()
+            if not t:
+                return True
+            bad_sub = (
+                "your",
+                "example",
+                "sample",
+                "test",
+                "mock",
+                "dummy",
+                "xxxx",
+                "xxxxx",
+                "xxx",
+                "replace",
+                "template",
+                "default",
+                "config",
+                "prompt",
+                "appid",
+                "app_id",
+            )
+            if any(x in t for x in bad_sub):
+                return True
+            if len(t) >= 16:
+                unique_chars = set(t)
+                if len(unique_chars) == 1:
+                    return True
+                if unique_chars.issubset({"0", "x", "f"}):
+                    return True
+            if re.findall(r"(your.*key|key.*here|api[_-]?key.*here|xxx+|^sk-[-_x]+$)", t, flags=re.I):
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _is_valid_email(value: str) -> bool:
+        try:
+            if not value or "@" not in value:
+                return False
+            local, _, domain = value.partition("@")
+            if not local or not domain or "." not in domain:
+                return False
+            lowered = domain.lower()
+            banned_suffixes = (".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", ".bmp", ".pdf")
+            if any(lowered.endswith(sfx) for sfx in banned_suffixes):
+                return False
+            if re.search(r"[^a-z0-9_.+-]", local, flags=re.I):
+                return False
+            return True
+        except Exception:
+            return False
+
     # extract keys from content (with positions)
     key_pattern = trim(key_pattern)
     if not key_pattern:
@@ -996,26 +1050,6 @@ def collect(
             ep_re = re.compile(endpoint_pattern, flags=re.I | re.S)
         except Exception:
             ep_re = re.compile(endpoint_pattern)
-
-        # Simple placeholder filter to drop obvious fake/template keys
-        def _is_placeholder(s: str) -> bool:
-            try:
-                t = str(s or "").strip().lower()
-                if not t:
-                    return True
-                bad_sub = (
-                    "your", "example", "sample", "test", "mock", "dummy",
-                    "xxxx", "xxxxx", "xxx", "replace", "template", "default",
-                    "config", "prompt", "appid", "app_id"
-                )
-                if any(x in t for x in bad_sub):
-                    return True
-                # common forms like sk-ant-your-...-here or api_key_here
-                if re.findall(r"(your.*key|key.*here|api[_-]?key.*here|xxx+|^sk-[-_x]+$)", t, flags=re.I):
-                    return True
-                return False
-            except Exception:
-                return False
 
         key_matches: List[Tuple[str, int, int]] = []  # (value, start, end)
         for m in key_re.finditer(content):
@@ -1168,6 +1202,9 @@ def collect(
     keys = extract(text=content, regex=key_pattern)
     if not keys:
         return []
+    keys = [k for k in keys if not _is_placeholder(k)]
+    if not keys:
+        return []
 
     address_pattern = trim(address_pattern)
     addresses = extract(text=content, regex=address_pattern)
@@ -1194,6 +1231,19 @@ def collect(
             return []
     if not endpoints:
         endpoints.append("")
+    else:
+        filtered_eps = []
+        for ep in endpoints:
+            ep_clean = trim(ep)
+            if not ep_clean:
+                continue
+            if "@" in ep_clean and not _is_valid_email(ep_clean):
+                continue
+            filtered_eps.append(ep_clean)
+        if not filtered_eps:
+            endpoints = [""]
+        else:
+            endpoints = filtered_eps
 
     for key, address, endpoint, model in itertools.product(keys, addresses, endpoints, models):
         candidates.append(Service(address=address, endpoint=endpoint, key=key, model=model))

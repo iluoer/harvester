@@ -20,6 +20,37 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from .balancer import Balancer, Strategy
+import json, time, urllib.request
+from typing import Tuple
+
+RATE_LIMIT_CACHE_TTL = 20  # seconds
+
+_rate_cache = {}
+
+def _get_github_rate(token: str) -> Tuple[int, int]:
+    """Return (core_remaining, search_remaining) for a token, with simple TTL cache."""
+    now = time.time()
+    ent = _rate_cache.get(token)
+    if ent and ent[2] > now:
+        return ent[0], ent[1]
+    core = search = -1
+    try:
+        req = urllib.request.Request(
+            'https://api.github.com/rate_limit',
+            headers={
+                'Accept': 'application/vnd.github+json',
+                'Authorization': f'token {token}',
+                'X-GitHub-Api-Version': '2022-11-28',
+            }
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode('utf-8', 'ignore'))
+        core = int(((data or {}).get('resources', {}) or {}).get('core', {}).get('remaining', -1))
+        search = int(((data or {}).get('resources', {}) or {}).get('search', {}).get('remaining', -1))
+    except Exception:
+        pass
+    _rate_cache[token] = (core, search, now + RATE_LIMIT_CACHE_TTL)
+    return core, search
 
 
 @dataclass
@@ -69,12 +100,20 @@ class Credentials:
         self.sessions = sessions.copy() if sessions else []
         self.tokens = tokens.copy() if tokens else []
 
-        # Convert string strategy to enum
-        strategy_enum = Strategy.ROUND_ROBIN if strategy == "round_robin" else Strategy.RANDOM
+        # Convert string strategy to enum (supports healthy_first)
+        if strategy == "round_robin":
+            strategy_enum = Strategy.ROUND_ROBIN
+        elif strategy == "random":
+            strategy_enum = Strategy.RANDOM
+        else:
+            strategy_enum = Strategy.ROUND_ROBIN
 
         # Create balancers for each credential type
         self.session_balancer = Balancer(self.sessions, strategy_enum) if self.sessions else None
         self.token_balancer = Balancer(self.tokens, strategy_enum) if self.tokens else None
+
+        # Keep configured strategy string for custom logic
+        self._strategy_name = strategy
 
         self.lock = threading.Lock()
         self.total_requests = 0
@@ -107,6 +146,32 @@ class Credentials:
         with self.lock:
             self.total_requests += 1
             self.token_requests += 1
+            # Healthy-first: pick healthiest token and skip bad ones
+            if self._strategy_name == "healthy_first":
+                best = None
+                best_score = -1
+                backup = None
+                backup_score = -1
+                for t in self.tokens:
+                    core, search = _get_github_rate(t)
+                    # primary score: core remaining
+                    score = core if isinstance(core, int) else -1
+                    # keep a backup if core is empty but search has quota
+                    if (isinstance(search, int) and search > 0) and (search > backup_score):
+                        backup_score = search
+                        backup = t
+                    if isinstance(score, int) and score > best_score:
+                        best_score = score
+                        best = t
+                # prefer core-quota tokens strictly > 0
+                if isinstance(best_score, int) and best_score > 0 and best is not None:
+                    return best
+                # fallback to search-quota-only token if available
+                if isinstance(backup_score, int) and backup_score > 0 and backup is not None:
+                    return backup
+                # no healthy token now -> return None to allow session or wait
+                return None
+            # default strategies
             return self.token_balancer.get()
 
     def get_credential(self, prefer_token: bool = True) -> Tuple[str, str]:

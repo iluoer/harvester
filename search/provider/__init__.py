@@ -20,6 +20,8 @@ from .vertex import VertexProvider
 from .generic_bearer import GenericBearerTokenProvider
 from .tencent_asr import TencentASRProvider
 from .github import GitHubProvider
+from .fofa import FofaProvider
+from .shodan import ShodanProvider
 
 __all__ = [
     "AIBaseProvider",
@@ -38,4 +40,6 @@ __all__ = [
     "GenericBearerTokenProvider",
     "TencentASRProvider",
     "GitHubProvider",
+    "FofaProvider",
+    "ShodanProvider",
 ]

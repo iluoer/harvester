@@ -105,14 +105,16 @@ class LoadBalanceStrategy(Enum):
 
     ROUND_ROBIN = "round_robin"
     RANDOM = "random"
+    HEALTHY_FIRST = "healthy_first"
 
     def get_display_name(self) -> str:
         """Get human-readable display name"""
         display_names = {
             LoadBalanceStrategy.ROUND_ROBIN: "Round Robin",
             LoadBalanceStrategy.RANDOM: "Random",
+            LoadBalanceStrategy.HEALTHY_FIRST: "Healthy First",
         }
-        return display_names.get(self, self.value.title())
+        return display_names.get(self, self.value.replace('_', ' ').title())
 
 
 @unique

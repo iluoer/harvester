@@ -5,10 +5,11 @@ Built-in stage definitions for the pipeline system.
 Registers all standard pipeline stages with their dependencies.
 """
 
+import copy
 import math
 import threading
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 
 from constant.search import (
     API_LIMIT,
@@ -87,110 +88,77 @@ class SearchStage(BasePipelineStage):
 
     def _search_worker(self, task: SearchTask) -> Optional[StageOutput]:
         """Pure functional search worker"""
-        try:
-            # Execute search based on page number
-            if task.page == 1:
-                results, content, total = self._execute_first_page_search(task)
-            else:
-                results, content = self._execute_page_search(task)
-                total = 0
+        # Execute search based on page number
+        if task.page == 1:
+            results, content, total = self._execute_first_page_search(task)
+        else:
+            results, content = self._execute_page_search(task)
+            total = 0
 
-            # Optional fallback: if API returned nothing OR error, try web session once (guarded by extras.fallback_web)
-            try:
-                should_fallback = (
-                    task.page == 1 and task.use_api and (not results) and (total == 0 or not content)
-                )
-                # Additionally fallback if client layer marked rate/abuse (401/403/429) on first page
-                # We piggyback on last log or a soft flag in content; since we don't pass error codes here,
-                # we conservatively fallback when content is empty and results empty.
-                if should_fallback:
-                    task_cfg = self.resources.task_configs.get(task.provider)
-                    fallback_enabled = bool(getattr(task_cfg, "extras", {}).get("fallback_web", False)) if task_cfg else False
-                    # Only fallback if we have a session available
-                    if fallback_enabled and self.resources.auth.get_session() is not None:
-                        logger.info(f"[{self.name}] API returned 0/empty for {task.provider}, falling back to web session once for query: {task.query}")
-                        # Execute a one-off web search for first page
-                        # Note: search_with_count returns (results, total, content)
-                        w_results, w_total, w_content = client.search_with_count(
-                            query=self._preprocess_query(task.query, False),
-                            session=self.resources.auth.get_session(),
-                            page=1,
-                            with_api=False,
-                            peer_page=WEB_RESULTS_PER_PAGE,
-                        )
-                        # If web found anything, override current variables
-                        if w_results or (isinstance(w_total, (int, float)) and w_total > 0):
-                            results, content, total = w_results, w_content, w_total
-            except Exception:
-                pass
+        # Create output object
+        output = StageOutput(task=task)
 
-            # Create output object
-            output = StageOutput(task=task)
-
-            # Extract keys directly from search content
-            keys = []
-            if content and task.regex:
-                keys = self._extract_keys_from_content(content, task)
-                scheduled = 0
-                skipped_half = 0
-                for key_service in keys:
-                    # If endpoint is required (endpoint_pattern configured) but missing, skip immediate check
-                    ep_required = bool(task.endpoint_pattern)
-                    has_endpoint = bool(getattr(key_service, 'endpoint', '') or '')
+        # Extract keys directly from search content
+        keys = []
+        if content and task.regex:
+            keys = self._extract_keys_from_content(content, task)
+            scheduled = 0
+            skipped_half = 0
+            for key_service in keys:
+                # If endpoint is required (endpoint_pattern configured) but missing, skip immediate check
+                ep_required = bool(task.endpoint_pattern)
+                has_endpoint = bool(getattr(key_service, 'endpoint', '') or '')
+                pair_half = ''
+                try:
+                    pair_half = (getattr(key_service, 'meta', {}) or {}).get('pair_half', '')
+                except Exception:
                     pair_half = ''
-                    try:
-                        pair_half = (getattr(key_service, 'meta', {}) or {}).get('pair_half', '')
-                    except Exception:
-                        pair_half = ''
-                    provider_lower = (task.provider or '').lower()
-                    if ep_required and (not has_endpoint or pair_half):
-                        # Normally skip half-candidates until paired. However, for Doubao we can
-                        # attempt a check with default model even without endpoint, as the API
-                        # accepts model name or endpoint id. Only proceed when a key is present.
-                        if provider_lower == 'doubao' and getattr(key_service, 'key', ''):
-                            check_task = TaskFactory.create_check_task(task.provider, key_service)
-                            output.add_task(check_task, PipelineStage.CHECK.value)
-                            scheduled += 1
-                            continue
-                        skipped_half += 1
+                provider_lower = (task.provider or '').lower()
+                if ep_required and (not has_endpoint or pair_half):
+                    # Normally skip half-candidates until paired. However, for some providers we can
+                    # attempt a check even without endpoint when the API accepts key-only.
+                    # - Doubao: accepts model name or endpoint id; allow when key present
+                    # - FOFA: key-only check is supported (email optional); allow when key present
+                    if (provider_lower == 'doubao' or provider_lower == 'fofa') and getattr(key_service, 'key', ''):
+                        check_task = TaskFactory.create_check_task(task.provider, key_service)
+                        output.add_task(check_task, PipelineStage.CHECK.value)
+                        scheduled += 1
                         continue
-                    check_task = TaskFactory.create_check_task(task.provider, key_service)
-                    output.add_task(check_task, PipelineStage.CHECK.value)
-                    scheduled += 1
+                    skipped_half += 1
+                    continue
+                check_task = TaskFactory.create_check_task(task.provider, key_service)
+                output.add_task(check_task, PipelineStage.CHECK.value)
+                scheduled += 1
 
-                if keys:
-                    logger.info(
-                        f"[{self.name}] extracted {len(keys)} keys from search content, scheduled checks: {scheduled}, skipped half: {skipped_half}, provider: {task.provider}"
-                    )
-
-            # Create acquisition tasks for links
-            if results:
-                patterns = Patterns(
-                    key_pattern=task.regex,
-                    address_pattern=task.address_pattern,
-                    endpoint_pattern=task.endpoint_pattern,
-                    model_pattern=task.model_pattern,
-                )
-                for link in results:
-                    acquisition_task = TaskFactory.create_acquisition_task(task.provider, link, patterns)
-                    output.add_task(acquisition_task, PipelineStage.GATHER.value)
-
-                # Add links to be saved
-                output.add_links(task.provider, results)
-
-            # Handle first page results for pagination/refinement
-            if task.page == 1 and total > 0:
-                self._handle_first_page_results(task, total, output)
-
+        if keys:
             logger.info(
-                f"[{self.name}] search completed for {task.provider}: {len(results) if results else 0} links, {len(keys)} keys"
+                f"[{self.name}] extracted {len(keys)} keys from search content, scheduled checks: {scheduled}, skipped half: {skipped_half}, provider: {task.provider}"
             )
 
-            return output
+        # Create acquisition tasks for links
+        if results:
+            patterns = Patterns(
+                key_pattern=task.regex,
+                address_pattern=task.address_pattern,
+                endpoint_pattern=task.endpoint_pattern,
+                model_pattern=task.model_pattern,
+            )
+            for link in results:
+                acquisition_task = TaskFactory.create_acquisition_task(task.provider, link, patterns)
+                output.add_task(acquisition_task, PipelineStage.GATHER.value)
 
-        except Exception as e:
-            logger.error(f"[{self.name}] error, provider: {task.provider}, task: {task}, message: {e}")
-            return None
+            # Add links to be saved
+            output.add_links(task.provider, results)
+
+        # Handle first page results for pagination/refinement
+        if task.page == 1 and total > 0:
+            self._handle_first_page_results(task, total, output)
+
+        logger.info(
+            f"[{self.name}] search completed for {task.provider}: {len(results) if results else 0} links, {len(keys)} keys"
+        )
+
+        return output
 
     def _execute_first_page_search(self, task: SearchTask) -> Tuple[List[str], str, int]:
         """Execute first page search and get total count in single request"""
@@ -280,14 +248,14 @@ class SearchStage(BasePipelineStage):
         limit = API_LIMIT if task.use_api else WEB_LIMIT
         per_page = API_RESULTS_PER_PAGE if task.use_api else WEB_RESULTS_PER_PAGE
 
-        # Check per-provider extras to optionally disable refine
-        refine_enabled = True
+        # Check per-provider extras to optionally enable refine (default off to simplify config)
+        refine_enabled = False
         try:
             task_cfg = self.resources.task_configs.get(task.provider)
             if task_cfg and getattr(task_cfg, 'extras', None):
-                refine_enabled = bool(task_cfg.extras.get('refine', True))
+                refine_enabled = bool(task_cfg.extras.get('refine', False))
         except Exception:
-            refine_enabled = True
+            refine_enabled = False
 
         # If needs refine query and refine is enabled
         if total > limit and refine_enabled:
@@ -541,51 +509,49 @@ class AcquisitionStage(BasePipelineStage):
                 queries: List[str] = []
                 repo_scope = f"repo:{owner}/{repo}"
                 prov = (task.provider or '').lower()
-                if prov == 'tencent_asr':
-                    if pair_half == 'key_only':
-                        queries = [f"{repo_scope} AKID", f"{repo_scope} SecretId"]
-                    elif pair_half == 'endpoint_only':
-                        queries = [f"{repo_scope} SecretKey", f"{repo_scope} TENCENTCLOUD_SECRETKEY"]
-                elif prov == 'doubao':
-                    if pair_half == 'key_only':
-                        # have key, need endpointId (ep-...)
-                        queries = [
-                            f"{repo_scope} ep-",
-                            f"{repo_scope} endpointId",
-                            f"{repo_scope} ep- path:.github/workflows",
-                        ]
-                    elif pair_half == 'endpoint_only':
-                        # have endpointId, need key/token
-                        queries = [
-                            f"{repo_scope} ARK_API_KEY filename:.env",
-                            f"{repo_scope} VOLCENGINE_ACCESS_TOKEN filename:.env",
-                            f"{repo_scope} VOLC_ACCESS_TOKEN filename:.env",
-                            f"{repo_scope} ARK_API_KEY path:.github/workflows",
-                        ]
+                # Load pair queries from config instead of hardcoding per provider
+                pair_q_cfg = {}
+                try:
+                    cfg = self.resources.task_configs.get(task.provider)
+                    if cfg and getattr(cfg, 'extras', None):
+                        pair_q_cfg = (cfg.extras or {}).get('pair_queries', {}) or {}
+                except Exception:
+                    pair_q_cfg = {}
+                qlist = pair_q_cfg.get(pair_half) or []
+                # Replace {repo_scope}
+                queries = [ (q or '').replace('{repo_scope}', repo_scope) for q in qlist if isinstance(q, str) and q.strip() ]
                 # qianfan provider removed
                 if not queries:
                     return
                 # Bound the number of follow-up searches
-                queries = queries[: extras.get('repo_pair_search_cap', 2) ]
+                cap = int(extras.get('repo_pair_search_cap', 2) or 2)
+                queries = queries[: cap ]
                 for q in queries:
                     # Choose regex according to which half we are missing
                     desired_regex = task.key_pattern or ''
                     try:
-                        if prov in ('tencent_asr', 'doubao'):
+                        if prov in ('tencent_asr', 'doubao', 'fofa'):
                             if pair_half == 'key_only':
-                                # search endpoints/appid for these providers
+                                # for these providers, we have key and need endpoint/email/appid
                                 desired_regex = task.endpoint_pattern or ''
                             elif pair_half == 'endpoint_only':
                                 desired_regex = task.key_pattern or ''
                     except Exception:
                         desired_regex = task.key_pattern or ''
 
+                    use_api_flag = True
+                    try:
+                        cfg = self.resources.task_configs.get(task.provider)
+                        use_api_flag = getattr(cfg, 'use_api', True)
+                    except Exception:
+                        use_api_flag = True
+
                     st = TaskFactory.create_search_task(
                         provider=task.provider,
                         query=q,
                         regex=desired_regex,
                         page=1,
-                        use_api=True,
+                        use_api=use_api_flag,
                         address_pattern=task.address_pattern or '',
                         endpoint_pattern=task.endpoint_pattern or '',
                         model_pattern=task.model_pattern or '',
@@ -608,9 +574,25 @@ class AcquisitionStage(BasePipelineStage):
                         paired = AcquisitionStage._try_instant_pair(service)
                         if paired:
                             complete.append(paired)
-                        else:
-                            _emit_repo_pair_searches(service)
-                        # Do not send original half-candidate to check yet
+                            continue
+
+                        _emit_repo_pair_searches(service)
+
+                        pair_type = meta.get('pair_half') if isinstance(meta, dict) else None
+                        if (
+                            extras.get('check_half_key', False)
+                            and pair_type == 'key_only'
+                            and getattr(service, 'key', '').strip()
+                        ):
+                            try:
+                                promoted = copy.deepcopy(service)
+                                if hasattr(promoted, 'meta') and isinstance(promoted.meta, dict):
+                                    promoted.meta.pop('pair_half', None)
+                                complete.append(promoted)
+                                continue
+                            except Exception:
+                                logger.debug("[gather] failed to promote half-candidate for %s", task.provider)
+                        # Skip original half-candidate to avoid duplicate checks until paired or promoted
                         continue
                     complete.append(service)
 
