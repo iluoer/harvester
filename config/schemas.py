@@ -250,8 +250,8 @@ class ApiConfig:
     """API configuration for a provider"""
 
     base_url: str = ""
-    completion_path: str = "/v1/chat/completions"
-    model_path: str = "/v1/models"
+    completion_path: str = ""
+    model_path: str = ""
     default_model: str = ""
     auth_key: str = "Authorization"
     extra_headers: Dict[str, str] = field(default_factory=dict)

@@ -24,6 +24,7 @@ import logging
 import logging.handlers
 import os
 import platform
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -222,33 +223,159 @@ class FileFormatter(logging.Formatter):
         return super().format(record)
 
 
-class LazyRotatingFileHandler(logging.handlers.RotatingFileHandler):
-    """A RotatingFileHandler that creates the log file only when first log message is written"""
+class SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Cross-platform safe rotating file handler with hybrid rollover strategy"""
 
     def __init__(self, filename, mode="a", max_bytes=0, backup_count=0, encoding=None):
-        """Initialize with delayed file creation to avoid creating files until first emit"""
+        """Initialize with delayed file creation and safe rollover"""
         super().__init__(filename, mode, max_bytes, backup_count, encoding, delay=True)
         self._initialized = False
+        self._rollover_retries = 3
+        self._rollover_delay = 0.1
+        self._rollover_stats = {"rename_success": 0, "copy_success": 0, "failures": 0}
 
     def _ensure_initialized(self):
-        """Ensure file is created and handler is fully initialized before first write"""
+        """Ensure file is created and handler is initialized before first write"""
         if not self._initialized:
-            # Ensure logs directory exists and handle archiving
             Logger._ensure_logs_directory()
-            # Initialize the handler (will create the file)
-            super().emit(
-                logging.LogRecord(name="", level=logging.DEBUG, pathname="", lineno=0, msg="", args=(), exc_info=None)
-            )
-            # Remove the dummy log entry
-            with open(self.baseFilename, "w", encoding=self.encoding) as f:
-                f.truncate(0)
+            # Create file if it doesn't exist
+            if not os.path.exists(self.baseFilename):
+                os.makedirs(os.path.dirname(self.baseFilename), exist_ok=True)
+                with open(self.baseFilename, "w", encoding=self.encoding):
+                    pass
             self._initialized = True
 
-    def emit(self, record):
-        """Ensure initialization before actually writing the log record"""
+    def emit(self, record: logging.LogRecord):
+        """Ensure initialization before writing log record"""
         if not self._initialized:
             self._ensure_initialized()
         super().emit(record)
+
+    def doRollover(self):
+        """Perform safe rollover with hybrid strategy"""
+        start_time = time.time()
+
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+
+        # Try hybrid rollover approach
+        success = self._try_rename_rollover()
+        if success:
+            self._rollover_stats["rename_success"] += 1
+        else:
+            success = self._try_copy_rollover()
+            if success:
+                self._rollover_stats["copy_success"] += 1
+
+        if not success:
+            # Fallback: just truncate current file
+            self._truncate_current()
+            self._rollover_stats["failures"] += 1
+
+        # Reopen stream
+        if not self.delay:
+            self.stream = self._open()
+
+        # Log performance if rollover took too long
+        duration = time.time() - start_time
+        if duration > 1.0:  # Log if rollover takes more than 1 second
+            print(f"Slow rollover detected: {duration:.2f}s for {self.baseFilename}")
+
+    def _try_rename_rollover(self):
+        """Try fast rename-based rollover (preferred method)"""
+        for i in range(self._rollover_retries):
+            try:
+                # Generate backup filename
+                backup_name = self._get_backup_name(1)
+
+                # Remove oldest backup if exists
+                if self.backupCount > 0:
+                    self._rotate_backups()
+
+                # Rename current file to backup
+                if os.path.exists(self.baseFilename):
+                    os.rename(self.baseFilename, backup_name)
+
+                return True
+
+            except (OSError, PermissionError) as e:
+                if i < self._rollover_retries - 1:
+                    time.sleep(self._rollover_delay * (i + 1))
+                    continue
+                # Log the failure but don't raise
+                print(f"Rename rollover failed: {e}")
+                return False
+
+        return False
+
+    def _try_copy_rollover(self):
+        """Try copy+truncate rollover (fallback method)"""
+        try:
+            # Generate backup filename
+            backup_name = self._get_backup_name(1)
+
+            # Remove oldest backup if exists
+            if self.backupCount > 0:
+                self._rotate_backups()
+
+            # Copy current file to backup
+            if os.path.exists(self.baseFilename):
+                shutil.copy2(self.baseFilename, backup_name)
+
+                # Truncate current file
+                with open(self.baseFilename, "w", encoding=self.encoding) as f:
+                    f.truncate(0)
+                    f.flush()
+
+            return True
+
+        except Exception as e:
+            print(f"Copy rollover failed: {e}")
+            return False
+
+    def _truncate_current(self):
+        """Fallback: just truncate current file"""
+        try:
+            with open(self.baseFilename, "w", encoding=self.encoding) as f:
+                f.truncate(0)
+                f.flush()
+                os.fsync(f.fileno())  # Force OS to write to disk
+        except Exception as e:
+            print(f"File truncation failed: {e}")
+
+    def _get_backup_name(self, index):
+        """Generate backup filename"""
+        return f"{self.baseFilename}.{index}"
+
+    def _rotate_backups(self):
+        """Rotate existing backup files"""
+        # Remove the oldest backup
+        oldest = self._get_backup_name(self.backupCount)
+        if os.path.exists(oldest):
+            try:
+                os.remove(oldest)
+            except OSError:
+                pass
+
+        # Rotate existing backups
+        for i in range(self.backupCount - 1, 0, -1):
+            old_name = self._get_backup_name(i)
+            new_name = self._get_backup_name(i + 1)
+            if os.path.exists(old_name):
+                try:
+                    os.rename(old_name, new_name)
+                except OSError:
+                    pass
+
+    def get_stats(self):
+        """Get handler statistics"""
+        return {
+            "rollover_stats": self._rollover_stats.copy(),
+            "retries": self._rollover_retries,
+            "delay": self._rollover_delay,
+            "file": self.baseFilename,
+        }
 
 
 class FileFormatterWithRedaction(logging.Formatter):
@@ -414,7 +541,7 @@ class Logger:
 
         # Main log file (all levels) - without timestamp
         main_log_file = Logger._logs_dir / "main.log"
-        Logger._file_handler = LazyRotatingFileHandler(
+        Logger._file_handler = SafeRotatingFileHandler(
             main_log_file, max_bytes=50 * 1024 * 1024, backup_count=10, encoding="utf-8"  # 50MB
         )
         Logger._file_handler.setFormatter(get_file_formatter())
@@ -431,7 +558,7 @@ class Logger:
 
         # Create module-specific log file
         module_log_file = Logger._logs_dir / f"{module_name}.log"
-        module_handler = LazyRotatingFileHandler(
+        module_handler = SafeRotatingFileHandler(
             module_log_file, max_bytes=20 * 1024 * 1024, backup_count=5, encoding="utf-8"  # 20MB
         )
         module_handler.setFormatter(get_file_formatter())
@@ -580,6 +707,37 @@ class Logger:
             logs_directory=str(Logger._logs_dir) if Logger._logs_dir else None,
         )
 
+    @staticmethod
+    def configure_rollover(retries: int = 3, delay: float = 0.1):
+        """Configure rollover behavior for all handlers"""
+
+        # Update main handler
+        if Logger._file_handler and isinstance(Logger._file_handler, SafeRotatingFileHandler):
+            Logger._file_handler._rollover_retries = retries
+            Logger._file_handler._rollover_delay = delay
+
+        # Update module handlers
+        for handler in Logger._module_handlers.values():
+            if isinstance(handler, SafeRotatingFileHandler):
+                handler._rollover_retries = retries
+                handler._rollover_delay = delay
+
+    @staticmethod
+    def get_rollover_stats():
+        """Get rollover performance statistics"""
+        stats = {}
+
+        # Main handler stats
+        if Logger._file_handler and isinstance(Logger._file_handler, SafeRotatingFileHandler):
+            stats["main"] = Logger._file_handler._rollover_stats.copy()
+
+        # Module handler stats
+        for name, handler in Logger._module_handlers.items():
+            if isinstance(handler, SafeRotatingFileHandler):
+                stats[name] = handler._rollover_stats.copy()
+
+        return stats
+
 
 def configure_logging_from_env() -> None:
     """Configure file format and color from environment variables.
@@ -673,21 +831,26 @@ def log_aggregated_error(logger: logging.Logger, error_key: str, message: str, *
         logger.error(message, *args, **kwargs)
 
 
-# Initialize logging system
-
-
 def get_logger(category: Optional[str] = None) -> logging.Logger:
     """Get or create a category logger using unified API."""
     name = (category or "main").strip() or "main"
     return Logger.setup_logger(name)
 
 
-def init_logging(level: str = "INFO", cleanup_days: int = 7, file_format: str = "text"):
+def init_logging(
+    level: str = "INFO",
+    cleanup_days: int = 7,
+    file_format: str = "text",
+    rollover_retries: int = 3,
+    rollover_delay: float = 0.1,
+):
     """
     Initialize logging system with specified level.
     :param level: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
     :param cleanup_days: Number of days to keep old log files (default: 7)
     :param file_format: File log format mode: "text" or "json"
+    :param rollover_retries: Number of retries for rollover operations (default: 3)
+    :param rollover_delay: Delay between rollover retries in seconds (default: 0.1)
     """
     Logger.update_log_levels(level)
 
@@ -699,6 +862,9 @@ def init_logging(level: str = "INFO", cleanup_days: int = 7, file_format: str = 
 
     # Setup file handlers
     Logger._setup_file_handlers()
+
+    # Configure rollover behavior
+    Logger.configure_rollover(rollover_retries, rollover_delay)
 
     # Attach redaction filter to all loggers (root level for simplicity)
     redaction_filter = RedactionFilter()
@@ -712,6 +878,7 @@ def init_logging(level: str = "INFO", cleanup_days: int = 7, file_format: str = 
     logger.info(f"Logging system initialized - Level: {level.upper()}")
     logger.info(f"Logs directory: {Logger.get_logs_directory()}")
     logger.info(f"Log cleanup: keeping files for {cleanup_days} days")
+    logger.info(f"Rollover config: {rollover_retries} retries, {rollover_delay}s delay")
 
 
 def _setup_exit_handlers():
@@ -740,6 +907,26 @@ def cleanup_logs(days: int = 7):
 def flush_logs():
     """Flush all log handlers to ensure data is written to files"""
     Logger.flush_all_handlers()
+
+
+def get_rollover_health():
+    """Get rollover health summary"""
+    stats = Logger.get_rollover_stats()
+    health = {}
+
+    for name, stat in stats.items():
+        total = stat["rename_success"] + stat["copy_success"] + stat["failures"]
+        if total > 0:
+            success_rate = (stat["rename_success"] + stat["copy_success"]) / total * 100
+            health[name] = {
+                "success_rate": f"{success_rate:.1f}%",
+                "total_rollovers": total,
+                "rename_success": stat["rename_success"],
+                "copy_fallback": stat["copy_success"],
+                "failures": stat["failures"],
+            }
+
+    return health
 
 
 def shutdown_logging():
