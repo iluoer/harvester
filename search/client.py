@@ -349,7 +349,7 @@ def chat(
             if code != 401:
                 try:
                     # read response body
-                    message = e.read().decode("utf8")
+                    message = e.read().decode("utf8").removeprefix("\n").removesuffix("\n")
 
                     # not a json string, use reason instead
                     if not message.startswith("{") or not message.endswith("}"):
