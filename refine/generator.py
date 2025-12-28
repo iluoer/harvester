@@ -51,19 +51,19 @@ class QueryGenerator(IQueryGenerator):
             if partitions > 0:
                 # Use depth-based generation logic
                 # Calculate minimum depth needed for target queries
-                min_depth = self._calculate_min_depth_for_target(strategy.segments, partitions)
+                depth = self._calculate_min_depth_for_target(strategy.segments, partitions)
+                parts_list = self._split_parts(strategy.segments, depth, partitions)
 
                 queries = set()
 
                 # Generate queries for each enumerable part with calculated depth
-                for target_segment in strategy.segments:
-                    part_queries = self._generate_queries_for_single_part(segments, target_segment, min_depth)
+                for target_segment, parts in zip(strategy.segments, parts_list):
+                    part_queries = self._generate_queries_for_single_part(segments, target_segment, depth, parts)
                     queries.update(part_queries)
 
                 result = list(queries)
                 logger.info(
-                    f"Generated {len(result)} unique queries with depth {min_depth} "
-                    f"from {len(strategy.segments)} parts"
+                    f"Generated {len(result)} unique queries with depth {depth} " f"from {len(strategy.segments)} parts"
                 )
                 return result
             else:
@@ -130,19 +130,154 @@ class QueryGenerator(IQueryGenerator):
         logger.debug(f"Cannot satisfy target {target_queries}, using max depth {result}")
         return result
 
+    def _max_depth(self, segment: CharClassSegment) -> int:
+        """Return maximum usable enumeration depth for a segment."""
+        if segment.max_length == 1:
+            return 1
+        if segment.max_length == float("inf"):
+            return self.max_depth
+        return min(int(segment.max_length), self.max_depth)
+
+    def _split_parts(self, segments: List[CharClassSegment], depth: int, parts: int) -> List[int]:
+        """Split partitions across segments by theoretical combination weight."""
+        if not segments:
+            return []
+        if parts <= 0:
+            return [parts] * len(segments)
+        if len(segments) == 1:
+            return [parts]
+
+        sizes = []
+        for segment in segments:
+            c = len(segment.effective_charset) if segment.effective_charset else len(segment.charset)
+            if c <= 0:
+                sizes.append(0)
+                continue
+            d = min(depth, self._max_depth(segment))
+            sizes.append(c**d)
+
+        total = sum(sizes)
+        if total <= 0:
+            base = max(1, parts // len(segments))
+            return [base] * len(segments)
+
+        raw = [parts * s / total for s in sizes]
+        alloc = [max(1, int(math.floor(x))) for x in raw]
+        rem = parts - sum(alloc)
+        if rem > 0:
+            order = sorted(range(len(segments)), key=lambda i: raw[i] - math.floor(raw[i]), reverse=True)
+            for i in order:
+                if rem <= 0:
+                    break
+                alloc[i] += 1
+                rem -= 1
+
+        return alloc
+
+    def _inner_size(self, segment: CharClassSegment, depth: int, parts: int) -> int:
+        """Compute last-layer group size for a segment."""
+        c = len(segment.effective_charset) if segment.effective_charset else len(segment.charset)
+        if c <= 0 or depth <= 0 or parts <= 0:
+            return 1
+        total = c**depth
+        size = max(1, total // parts)
+        return min(c, size)
+
+    def _split_chars(self, chars: List[str], size: int) -> List[List[str]]:
+        """Split chars into fixed-size groups."""
+        if size <= 0:
+            size = 1
+        return [chars[i : i + size] for i in range(0, len(chars), size)]
+
+    def _escape(self, c: str, flag: bool = False) -> str:
+        """Escape a character for regex usage."""
+        if c == "/":
+            return r"\/"
+        if c == "\\":
+            return r"\\"
+
+        if flag:
+            if c in "-]^":
+                return "\\" + c
+            return c
+
+        if c in r".^$|?*+(){}[]":
+            return "\\" + c
+        return c
+
+    def _build_str(self, group: List[str]) -> str:
+        """Build a regex character class string from a group."""
+        if len(group) == 1:
+            return self._escape(group[0])
+
+        content = "".join(self._escape(c, flag=True) for c in group)
+        return f"[{content}]"
+
+    def _grouped_combos(self, segment: CharClassSegment, depth: int, parts: int) -> List[str]:
+        """Generate grouped prefix combinations for a segment."""
+        chars = sorted(list(segment.effective_charset) or [])
+        if not chars:
+            return [""]
+
+        d = min(depth, self._max_depth(segment))
+        inner = self._inner_size(segment, d, parts)
+        groups = self._split_chars(chars, inner)
+
+        if d == 1:
+            return [self._build_str(g) for g in groups]
+
+        combos = []
+        for pre in itertools.product(chars, repeat=d - 1):
+            pre_str = self._escape_regex_chars("".join(pre))
+            for g in groups:
+                combos.append(pre_str + self._build_str(g))
+
+        return combos
+
+    def _enum_len(self, enum_value: str) -> int:
+        """Return how many characters a prefix regex consumes."""
+        if not enum_value:
+            return 0
+
+        i = 0
+        count = 0
+        while i < len(enum_value):
+            ch = enum_value[i]
+            if ch == "[":
+                # A character class consumes one character.
+                j = i + 1
+                while j < len(enum_value):
+                    if enum_value[j] == "\\" and j + 1 < len(enum_value):
+                        j += 2
+                        continue
+                    if enum_value[j] == "]":
+                        break
+                    j += 1
+                count += 1
+                i = j + 1 if j < len(enum_value) else len(enum_value)
+            elif ch == "\\" and i + 1 < len(enum_value):
+                # Escaped literal consumes one character.
+                count += 1
+                i += 2
+            else:
+                count += 1
+                i += 1
+
+        return count
+
     def _generate_queries_for_single_part(
-        self, segments: List[Segment], target: CharClassSegment, depth: int = -1
+        self, segments: List[Segment], target: CharClassSegment, depth: int = -1, parts: int = -1
     ) -> List[str]:
         """Generate queries by enumerating target segment with optional specific depth."""
-        if depth > 0:
-            # Use specific depth logic
-            combinations = self._generate_segment_combinations(target, depth)
+        if depth > 0 and parts > 0:
+            combos = self._grouped_combos(target, depth, parts)
+        elif depth > 0:
+            combos = self._generate_segment_combinations(target, depth)
         else:
-            # Use original logic
-            combinations = self._generate_segment_combinations(target)
+            combos = self._generate_segment_combinations(target)
 
         queries = []
-        for combo in combinations:
+        for combo in combos:
             # Apply enumeration only to target segment
             new_segments = self._apply_single_enumeration(segments, target, combo)
             pattern = self._reconstruct_pattern(new_segments)
@@ -151,9 +286,9 @@ class QueryGenerator(IQueryGenerator):
                 queries.append(pattern)
 
         # If no enumerated queries generated, force enumeration
-        if not queries and combinations:
+        if not queries and combos:
             # Force enumeration for all combinations (up to reasonable limit)
-            for combo in combinations:
+            for combo in combos:
                 new_segments = self._apply_single_enumeration(segments, target, combo)
                 pattern = self._reconstruct_pattern(new_segments)
                 if pattern:
@@ -326,8 +461,9 @@ class QueryGenerator(IQueryGenerator):
                     new_segments.append(fixed_seg)
 
                     # Create remaining character class segment
-                    remaining_min = max(0, segment.min_length - len(enum_value))
-                    remaining_max = max(0, segment.max_length - len(enum_value))
+                    length = self._enum_len(enum_value)
+                    remaining_min = max(0, segment.min_length - length)
+                    remaining_max = max(0, segment.max_length - length)
 
                     # Always create remaining segment for + and *, even if min=0
                     should_create_remaining = segment.original_quantifier in ["+", "*"] or remaining_max > 0
@@ -341,7 +477,9 @@ class QueryGenerator(IQueryGenerator):
                         remaining_seg.min_length = remaining_min
                         remaining_seg.max_length = remaining_max
                         remaining_seg.original_quantifier = self._adjust_quantifier(
-                            segment.original_quantifier, len(enum_value), segment
+                            segment.original_quantifier,
+                            length,
+                            segment,
                         )
                         new_segments.append(remaining_seg)
                 else:

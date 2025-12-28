@@ -61,10 +61,16 @@ class GeminiProvider(AIBaseProvider):
 
         message = trim(message)
         if code == 400:
-            if re.findall(r"API_KEY_INVALID", message, flags=re.I):
+            if re.findall(r"API_KEY_INVALID|API key expired", message, flags=re.I):
                 return CheckResult.fail(ErrorReason.INVALID_KEY)
             elif re.findall(r"FAILED_PRECONDITION", message, flags=re.I):
                 return CheckResult.fail(ErrorReason.NO_ACCESS)
+        elif code == 403:
+            if re.findall(r"PERMISSION_DENIED|Your API key was reported as leaked", message, flags=re.I):
+                return CheckResult.fail(ErrorReason.INVALID_KEY)
+        elif code == 429:
+            if re.findall(r"RESOURCE_EXHAUSTED|Quota exceeded for quota metric", message, flags=re.I):
+                return CheckResult.fail(ErrorReason.NO_QUOTA)
 
         return super()._judge(code, message)
 
