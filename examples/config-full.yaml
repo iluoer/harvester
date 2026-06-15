@@ -7,6 +7,9 @@ global:
   workspace: "./data"
   # Maximum number of times a task can be requeued after failure
   max_retries_requeued: 3
+  # Optional HTTP proxy for all outbound HTTP requests. Supports http, https and socks5
+  # Example: "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
+  proxy: ""
   # GitHub credentials configuration
   github_credentials:
     # GitHub session tokens (recommended for higher rate limits)

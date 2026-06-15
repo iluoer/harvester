@@ -23,6 +23,7 @@ from core.models import CheckResult, Condition
 from tools.coordinator import get_user_agent
 from tools.utils import trim
 
+from ..client import urlopen
 from .base import AIBaseProvider
 
 
@@ -122,7 +123,7 @@ class StabilityAIProvider(AIBaseProvider):
             code, message, attempt, retries = 401, "", 0, max(1, retries)
             while attempt < retries:
                 try:
-                    with urllib.request.urlopen(req, timeout=15, context=CTX) as response:
+                    with urlopen(req, timeout=15, context=CTX) as response:
                         code = 200
                         message = response.read().decode("utf8")
                         break

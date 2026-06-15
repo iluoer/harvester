@@ -9,6 +9,7 @@ import itertools
 import json
 import random
 import re
+import socket
 import time
 import traceback
 import urllib.error
@@ -21,6 +22,76 @@ from tools.logger import get_logger
 from tools.utils import encoding_url, isblank, trim
 
 logger = get_logger("search")
+
+_ORIGINAL_SOCKET = socket.socket
+_HTTP_OPENER = urllib.request.build_opener()
+_HTTP_PROXY = ""
+
+
+def set_proxy(proxy: Optional[str]) -> None:
+    """Configure the process-wide opener used by search HTTP requests."""
+    global _HTTP_OPENER, _HTTP_PROXY
+
+    proxy = trim(proxy)
+
+    # Reset any previous SOCKS monkey-patch before applying the new setting
+    socket.socket = _ORIGINAL_SOCKET
+
+    if not proxy:
+        _HTTP_PROXY = ""
+        _HTTP_OPENER = urllib.request.build_opener()
+        logger.info("HTTP proxy disabled")
+        return
+
+    parsed = urllib.parse.urlparse(proxy)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https", "socks5"}:
+        raise ValueError("proxy scheme must be one of: http, https, socks5")
+    if not parsed.hostname:
+        raise ValueError("proxy must include a host")
+
+    try:
+        parsed.port
+    except ValueError as e:
+        raise ValueError(f"invalid proxy port: {e}") from e
+
+    if scheme == "socks5":
+        if parsed.port is None:
+            raise ValueError("socks5 proxy must include a port")
+
+        try:
+            import socks
+        except ImportError as e:
+            raise RuntimeError("SOCKS5 proxy requires the PySocks package. Install it with: pip install PySocks") from e
+
+        socks.set_default_proxy(
+            socks.PROXY_TYPE_SOCKS5,
+            parsed.hostname,
+            parsed.port,
+            username=urllib.parse.unquote(parsed.username) if parsed.username else None,
+            password=urllib.parse.unquote(parsed.password) if parsed.password else None,
+        )
+        socket.socket = socks.socksocket
+        _HTTP_OPENER = urllib.request.build_opener()
+    else:
+        _HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+
+    _HTTP_PROXY = proxy
+    logger.info(f"HTTP proxy enabled: {scheme}://{parsed.hostname}:{parsed.port or ''}")
+
+
+def urlopen(request, timeout: float = 10, context=None):
+    """Open a URL through the configured global HTTP proxy when present."""
+    if context is None:
+        return _HTTP_OPENER.open(request, timeout=timeout)
+
+    handlers = [urllib.request.HTTPSHandler(context=context)]
+    parsed = urllib.parse.urlparse(_HTTP_PROXY)
+    if _HTTP_PROXY and parsed.scheme.lower() in {"http", "https"}:
+        handlers.insert(0, urllib.request.ProxyHandler({"http": _HTTP_PROXY, "https": _HTTP_PROXY}))
+
+    return urllib.request.build_opener(*handlers).open(request, timeout=timeout)
+
 
 from constant.search import API_RESULTS_PER_PAGE, WEB_RESULTS_PER_PAGE
 from constant.system import (
@@ -250,9 +321,7 @@ def http_get(
 
         # Make request with managed network resource
         request = urllib.request.Request(url=encoded_url, headers=headers)
-        with managed_network(
-            urllib.request.urlopen(request, timeout=timeout, context=CTX), "http_connection"
-        ) as response:
+        with managed_network(urlopen(request, timeout=timeout, context=CTX), "http_connection") as response:
             # Handle response
             content = response.read()
             status_code = response.getcode()
@@ -340,7 +409,7 @@ def chat(
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     while attempt < retries:
         try:
-            with urllib.request.urlopen(req, timeout=timeout, context=CTX) as response:
+            with urlopen(req, timeout=timeout, context=CTX) as response:
                 code = 200
                 message = response.read().decode("utf8")
                 break

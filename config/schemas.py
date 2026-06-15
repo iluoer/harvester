@@ -15,6 +15,7 @@ Key Features:
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from core.enums import LoadBalanceStrategy, PipelineStage
 from core.models import Condition, Patterns, RateLimitConfig
@@ -49,11 +50,14 @@ class GlobalConfig:
 
     workspace: str = "./data"
     max_retries_requeued: int = 3
+    proxy: str = ""
     github_credentials: Optional[CredentialsConfig] = None
     user_agents: List[str] = field(default_factory=list)
 
     def __post_init__(self):
         """Set default values if none provided"""
+        self.proxy = self._normalize_proxy(self.proxy)
+
         # Set default credentials with placeholder values
         if self.github_credentials is None:
             self.github_credentials = CredentialsConfig(
@@ -69,6 +73,38 @@ class GlobalConfig:
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
             ]
+
+    @staticmethod
+    def _normalize_proxy(proxy: Optional[str]) -> str:
+        """Validate and normalize the global HTTP proxy URL."""
+        if proxy is None:
+            return ""
+
+        if not isinstance(proxy, str):
+            raise ValueError("proxy must be a string")
+
+        proxy = proxy.strip()
+        if not proxy:
+            return ""
+
+        parsed = urlparse(proxy)
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https", "socks5"}:
+            raise ValueError("proxy scheme must be one of: http, https, socks5")
+
+        if not parsed.hostname:
+            raise ValueError("proxy must include a host")
+
+        # Accessing port validates the port syntax and range
+        try:
+            port = parsed.port
+        except ValueError as e:
+            raise ValueError(f"invalid proxy port: {e}") from e
+
+        if scheme == "socks5" and port is None:
+            raise ValueError("socks5 proxy must include a port")
+
+        return proxy
 
 
 def _get_default_threads() -> Dict[str, int]:

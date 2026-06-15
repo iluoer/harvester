@@ -20,6 +20,7 @@ from tools.coordinator import get_user_agent
 from tools.logger import get_logger
 from tools.utils import trim
 
+from ..client import urlopen
 from .base import AIBaseProvider
 from .registry import register_provider
 
@@ -87,7 +88,7 @@ class AnthropicProvider(AIBaseProvider):
             req = urllib.request.Request(url, headers=headers, method="GET")
             while attempt < retries:
                 try:
-                    with urllib.request.urlopen(req, timeout=timeout, context=CTX) as response:
+                    with urlopen(req, timeout=timeout, context=CTX) as response:
                         content = response.read().decode("utf8")
                         success = True
                         break

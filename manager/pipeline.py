@@ -59,6 +59,9 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
 
         self.rate_limiter = RateLimiter(config.ratelimits)
 
+        # Configure the shared HTTP opener before any stage starts making network requests
+        client.set_proxy(config.global_config.proxy)
+
         # Initialize GitHub client rate limiter
         client.init_github_client(config.ratelimits)
 

@@ -153,12 +153,25 @@ class ConfigLoader:
             strategy=LoadBalanceStrategy(credentials_data.get("strategy", "round_robin")),
         )
 
+        proxy = data.get("proxy") or self._get_env_ignore_case("https_proxy", "http_proxy")
+
         return GlobalConfig(
             workspace=os.path.abspath(data.get("workspace", "./data")),
             max_retries_requeued=data.get("max_retries_requeued", 3),
+            proxy=proxy,
             github_credentials=credentials,
             user_agents=data.get("user_agents", []),
         )
+
+    @staticmethod
+    def _get_env_ignore_case(*names: str) -> str:
+        """Read the first non-empty environment variable by name, ignoring case."""
+        env = {key.lower(): value for key, value in os.environ.items()}
+        for name in names:
+            value = env.get(name.lower(), "")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
 
     def _parse_pipeline_config(self, data: Dict[str, Any]) -> PipelineConfig:
         """Parse pipeline configuration section

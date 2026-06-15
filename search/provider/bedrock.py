@@ -19,7 +19,7 @@ from core.models import CheckResult, Condition
 from tools.logger import get_logger
 from tools.utils import trim
 
-from ..client import http_get
+from ..client import http_get, urlopen
 from .base import AIBaseProvider
 from .registry import register_provider
 
@@ -221,7 +221,7 @@ class BedrockProvider(AIBaseProvider):
                 req = urllib.request.Request(url, data=payload.encode("utf-8"), headers=headers, method="POST")
 
                 try:
-                    with urllib.request.urlopen(req, timeout=30) as response:
+                    with urlopen(req, timeout=30) as response:
                         return response.getcode(), response.read().decode("utf-8")
                 except urllib.error.HTTPError as e:
                     error_body = e.read().decode("utf-8") if e.fp else str(e.reason)

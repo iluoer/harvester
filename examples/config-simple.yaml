@@ -5,6 +5,8 @@
 global:
   # Working directory for data and results
   workspace: "./data"
+  # Optional HTTP proxy for all outbound HTTP requests. Supports http, https and socks5
+  proxy: ""
   # GitHub credentials settings
   github_credentials:
     sessions:
