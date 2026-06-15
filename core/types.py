@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from typing import List, Optional, Protocol
 
 from .metrics import PipelineStatus
-from .models import CheckResult, Condition, Patterns
+from .models import CheckResult, Condition, Patterns, ResultStorage
 
 
 class IAuthProvider(Protocol):
@@ -55,6 +55,12 @@ class IProvider(ABC):
     @abstractmethod
     def conditions(self) -> List[Condition]:
         """Search conditions for this provider"""
+        pass
+
+    @property
+    @abstractmethod
+    def result(self) -> ResultStorage:
+        """Result storage metadata for this provider"""
         pass
 
     @abstractmethod

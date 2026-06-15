@@ -173,6 +173,9 @@ class ConfigValidator:
         if not task.provider_type:
             self.errors.append(f"Provider type cannot be empty for task: {task.name}")
 
+        if task.storage.plan and not task.storage.directory:
+            self.errors.append(f"Task {task.name} storage.plan requires storage.directory")
+
         # Validate stage dependencies
         try:
             task.stages.validate()

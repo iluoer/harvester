@@ -19,6 +19,14 @@ from typing import Any, Dict, List, Optional, Set
 from .enums import ErrorReason
 
 
+@dataclass(frozen=True)
+class ResultStorage:
+    """Result persistence layout for a provider."""
+
+    folder: str
+    filenames: Dict[str, str] = field(default_factory=dict)
+
+
 @dataclass
 class ProviderTask(ABC):
     """Base class for all provider-specific tasks

@@ -33,6 +33,7 @@ from .schemas import (
     PersistenceConfig,
     PipelineConfig,
     StageConfig,
+    StorageConfig,
     TaskConfig,
     WorkerManagerConfig,
 )
@@ -346,12 +347,19 @@ class ConfigLoader:
             adaptive=rate_limit_data.get("adaptive", True),
         )
 
+        storage_data = data.get("storage", {})
+        storage = StorageConfig(
+            directory=storage_data.get("directory", ""),
+            plan=storage_data.get("plan", ""),
+        )
+
         return TaskConfig(
             name=data.get("name", ""),
             enabled=data.get("enabled", True),
             provider_type=data.get("provider_type", ""),
             use_api=data.get("use_api", False),
             stages=stages,
+            storage=storage,
             extras=data.get("extras", {}),
             api=api,
             patterns=patterns,

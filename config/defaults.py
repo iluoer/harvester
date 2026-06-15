@@ -75,6 +75,10 @@ def get_default_config() -> Dict[str, Any]:
                 },
                 "conditions": [{"query": '"T3BlbkFJ"'}],
                 "rate_limit": {"base_rate": 2.0, "burst_limit": 10, "adaptive": True},
+                "storage": {
+                    "directory": "",
+                    "plan": "",
+                },
             }
         ]
     )

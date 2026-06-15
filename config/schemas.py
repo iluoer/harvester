@@ -312,6 +312,14 @@ class StageConfig:
 
 
 @dataclass
+class StorageConfig:
+    """Result storage grouping for a provider task"""
+
+    directory: str = ""
+    plan: str = ""
+
+
+@dataclass
 class TaskConfig:
     """Configuration for a single provider task"""
 
@@ -320,6 +328,7 @@ class TaskConfig:
     provider_type: str = ""
     use_api: bool = False
     stages: StageConfig = field(default_factory=StageConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
     extras: Dict[str, Any] = field(default_factory=dict)
     api: ApiConfig = field(default_factory=ApiConfig)
     patterns: Patterns = field(default_factory=Patterns)

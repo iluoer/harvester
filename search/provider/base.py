@@ -10,7 +10,7 @@ import urllib.parse
 from typing import Dict, List, Optional, Union
 
 from core.enums import ErrorReason
-from core.models import CheckResult, Condition, Patterns
+from core.models import CheckResult, Condition, Patterns, ResultStorage
 from core.types import IProvider
 from tools.logger import get_logger
 from tools.utils import trim
@@ -18,6 +18,14 @@ from tools.utils import trim
 from ..client import chat
 
 logger = get_logger("provider")
+
+
+def _normalize_path(value: str) -> str:
+    value = trim(value)
+    if not value:
+        return ""
+
+    return re.sub(r"[^a-zA-Z0-9_\-]", "-", value, flags=re.I).strip("-").lower()
 
 
 class AIBaseProvider(IProvider):
@@ -70,6 +78,19 @@ class AIBaseProvider(IProvider):
         for key, value in values.items():
             kwargs.setdefault(key, value)
 
+    @staticmethod
+    def filenames() -> Dict[str, str]:
+        """Default result filenames used by AI providers."""
+        return {
+            "valid": "valid-keys.txt",
+            "no_quota": "no-quota-keys.txt",
+            "wait_check": "wait-check-keys.txt",
+            "invalid": "invalid-keys.txt",
+            "material": "material.txt",
+            "summary": "summary.json",
+            "links": "links.txt",
+        }
+
     def __init__(
         self,
         name: str,
@@ -97,33 +118,20 @@ class AIBaseProvider(IProvider):
         # provider name
         self._name = name
 
-        directory = ""
-        if kwargs:
-            directory = trim(kwargs.get("directory", ""))
+        storage = kwargs.pop("storage", {}) if kwargs else {}
+        directory, plan = "", ""
+        if isinstance(storage, dict):
+            directory = trim(storage.get("directory", ""))
+            plan = trim(storage.get("plan", ""))
 
-        # directory
-        self.directory = os.path.join(directory, re.sub(r"[^a-zA-Z0-9_\-]", "-", name, flags=re.I).lower())
+        if directory and plan:
+            folder = os.path.join(_normalize_path(directory), _normalize_path(plan))
+        elif directory:
+            folder = _normalize_path(directory)
+        else:
+            folder = _normalize_path(name)
 
-        # filename for valid keys
-        self.valid = "valid-keys.txt"
-
-        # filename for no quota keys
-        self.no_quota = "no-quota-keys.txt"
-
-        # filename for need check again keys
-        self.wait_check = "wait-check-keys.txt"
-
-        # filename for invalid keys
-        self.invalid = "invalid-keys.txt"
-
-        # filename for extract keys
-        self.material = "material.txt"
-
-        # filename for summary
-        self.summary = "summary.json"
-
-        # filename for links included keys
-        self.links = "links.txt"
+        self._result = ResultStorage(folder=folder, filenames=self.filenames())
 
         # base url for llm service api
         self._base_url = base_url
@@ -214,6 +222,11 @@ class AIBaseProvider(IProvider):
     def conditions(self) -> List:
         """Search conditions for this provider"""
         return self._conditions
+
+    @property
+    def result(self) -> ResultStorage:
+        """Result storage metadata for this provider"""
+        return self._result
 
     def get_patterns(self) -> Patterns:
         """Get patterns configuration for this provider"""

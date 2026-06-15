@@ -35,7 +35,7 @@ QUEUE_STATE_MAX_AGE_HOURS: int = 24
 class ResultMapping:
     """Configuration for result type field mapping"""
 
-    # Provider attribute name for filename
+    # ResultStorage filenames key
     filename: str
 
     # PersistenceMetrics field name for persistence stats

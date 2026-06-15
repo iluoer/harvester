@@ -239,5 +239,6 @@ tasks:
       recovery_factor: 1.1
       max_rate_multiplier: 2.0
       min_rate_multiplier: 0.1
-    extras:
-      directory: "customize"
+    storage:
+      directory: ""
+      plan: ""

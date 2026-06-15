@@ -91,6 +91,13 @@ class ProviderFactory:
         # Copy extras to avoid modifying original object
         kwargs = extras.copy()
 
+        storage = task_config.storage
+        if storage and (trim(storage.directory) or trim(storage.plan)):
+            kwargs["storage"] = {
+                "directory": storage.directory,
+                "plan": storage.plan,
+            }
+
         # Add API configuration parameters
         params = {
             "name": name,

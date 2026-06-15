@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from constant.runtime import RESULT_MAPPINGS
 from core.enums import ResultType
-from core.models import AllRecoveredTasks, RecoveredTasks, Service
+from core.models import AllRecoveredTasks, RecoveredTasks, ResultStorage, Service
 from core.types import IProvider
 from state.models import PersistenceMetrics
 from tools.logger import get_logger
@@ -105,13 +105,15 @@ class ResultManager:
         self.shutdown_timeout = float(max(1.0, shutdown_timeout))
 
         # Create provider directory
-        self.directory = os.path.join(workspace, "providers", self.provider.directory)
+        self.directory = os.path.join(workspace, "providers", self.provider.result.folder)
         os.makedirs(self.directory, exist_ok=True)
 
         # Build file paths from provider instance using configuration mapping
         self.files = dict()
         for result_type, mapping in RESULT_MAPPINGS.items():
-            filename = getattr(provider, mapping.filename)
+            filename = provider.result.filenames.get(mapping.filename, "")
+            if not filename:
+                continue
             self.files[result_type.value] = os.path.join(self.directory, filename)
 
         # Initialize persistence strategy based on mode
@@ -584,7 +586,10 @@ class ResultManager:
             return
 
         try:
-            filepath = self.files[ResultType.SUMMARY.value]
+            filepath = self.files.get(ResultType.SUMMARY.value)
+            if not filepath:
+                logger.debug(f"[persist] summary file not configured for {self.name}, skip models save")
+                return
 
             # Unique models
             unique_models = set()
@@ -777,14 +782,18 @@ if __name__ == "__main__":
     class MockProvider:
         def __init__(self):
             self.name = "test_provider"
-            self.directory = "test_provider"
-            self.keys_filename = "valid-keys.txt"
-            self.no_quota_filename = "no-quota-keys.txt"
-            self.wait_check_filename = "wait-check-keys.txt"
-            self.invalid_keys_filename = "invalid-keys.txt"
-            self.material_filename = "material.txt"
-            self.links_filename = "links.txt"
-            self.summary_filename = "summary.json"
+            self.result = ResultStorage(
+                folder="test_provider",
+                filenames={
+                    "valid": "valid-keys.txt",
+                    "no_quota": "no-quota-keys.txt",
+                    "wait_check": "wait-check-keys.txt",
+                    "invalid": "invalid-keys.txt",
+                    "material": "material.txt",
+                    "summary": "summary.json",
+                    "links": "links.txt",
+                },
+            )
 
     try:
         # Test single provider
