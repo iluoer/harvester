@@ -6,21 +6,20 @@ Anthropic provider implementation.
 
 import json
 import re
-import socket
 import time
 import traceback
-import urllib.error
-import urllib.request
 from typing import Dict, List, Optional
 
-from constant.system import CTX, NO_RETRY_ERROR_CODES
+import requests
+
+from constant.system import NO_RETRY_ERROR_CODES
 from core.enums import ErrorReason
 from core.models import CheckResult, Condition
 from tools.coordinator import get_user_agent
 from tools.logger import get_logger
 from tools.utils import trim
 
-from ..client import urlopen
+from ..client import http_error_message, http_error_status, request
 from .base import AIBaseProvider
 from .registry import register_provider
 
@@ -85,25 +84,20 @@ class AnthropicProvider(AIBaseProvider):
             content, success = "", False
             attempt, retries, timeout = 0, 3, 10
 
-            req = urllib.request.Request(url, headers=headers, method="GET")
             while attempt < retries:
                 try:
-                    with urlopen(req, timeout=timeout, context=CTX) as response:
-                        content = response.read().decode("utf8")
+                    with request("GET", url, headers=headers, timeout=timeout) as response:
+                        content = response.text
                         success = True
                         break
-                except urllib.error.HTTPError as e:
-                    if e.code == 401:
+                except requests.exceptions.HTTPError as e:
+                    code = http_error_status(e)
+                    if code == 401:
                         return CheckResult.fail(ErrorReason.INVALID_KEY)
                     else:
-                        try:
-                            content = e.read().decode("utf8")
-                            if not content.startswith("{") or not content.endswith("}"):
-                                content = e.reason
-                        except:
-                            content = e.reason
+                        content = http_error_message(e)
 
-                        if e.code == 403:
+                        if code == 403:
                             message = ""
                             try:
                                 data = json.loads(content)
@@ -114,10 +108,10 @@ class AnthropicProvider(AIBaseProvider):
                             if re.findall(r"Invalid authorization", message, flags=re.I):
                                 return CheckResult.fail(ErrorReason.INVALID_KEY)
 
-                        if e.code in NO_RETRY_ERROR_CODES:
+                        if code in NO_RETRY_ERROR_CODES:
                             break
                 except Exception as e:
-                    if not isinstance(e, urllib.error.URLError) or not isinstance(e.reason, socket.timeout):
+                    if not isinstance(e, requests.exceptions.Timeout):
                         logger.error(f"Check Claude session error, key: {token}, message: {traceback.format_exc()}")
 
                 attempt += 1

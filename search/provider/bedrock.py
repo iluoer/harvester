@@ -9,9 +9,10 @@ import hmac
 import json
 import re
 import urllib.parse
-import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
+
+import requests
 
 from constant.system import DEFAULT_QUESTION
 from core.enums import ErrorReason
@@ -19,7 +20,7 @@ from core.models import CheckResult, Condition
 from tools.logger import get_logger
 from tools.utils import trim
 
-from ..client import http_get, urlopen
+from ..client import http_error_message, http_error_status, http_get, request
 from .base import AIBaseProvider
 from .registry import register_provider
 
@@ -178,7 +179,7 @@ class BedrockProvider(AIBaseProvider):
     ) -> Dict[str, str]:
         """Sign AWS request with SigV4."""
         # Generate timestamp
-        now = datetime.now(datetime.timezone.utc)
+        now = datetime.now(timezone.utc)
         timestamp = now.strftime("%Y%m%dT%H%M%SZ")
 
         # Parse host from URL
@@ -217,15 +218,11 @@ class BedrockProvider(AIBaseProvider):
                 else:
                     return 500, "Request failed"
             elif method == "POST":
-                # For POST requests, we need to implement our own request
-                req = urllib.request.Request(url, data=payload.encode("utf-8"), headers=headers, method="POST")
-
                 try:
-                    with urlopen(req, timeout=30) as response:
-                        return response.getcode(), response.read().decode("utf-8")
-                except urllib.error.HTTPError as e:
-                    error_body = e.read().decode("utf-8") if e.fp else str(e.reason)
-                    return e.code, error_body
+                    with request("POST", url, data=payload.encode("utf-8"), headers=headers, timeout=30) as response:
+                        return response.status_code, response.text
+                except requests.exceptions.HTTPError as e:
+                    return http_error_status(e), http_error_message(e)
                 except Exception as e:
                     return 500, str(e)
             else:

@@ -9,13 +9,12 @@ import itertools
 import json
 import random
 import re
-import socket
 import time
 import traceback
-import urllib.error
 import urllib.parse
-import urllib.request
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import requests
 
 from core.models import Service
 from tools.logger import get_logger
@@ -23,23 +22,46 @@ from tools.utils import encoding_url, isblank, trim
 
 logger = get_logger("search")
 
-_ORIGINAL_SOCKET = socket.socket
-_HTTP_OPENER = urllib.request.build_opener()
+_HTTP_SESSION = requests.Session()
+_HTTP_SESSION.trust_env = False
 _HTTP_PROXY = ""
 
 
+def _new_session(proxy: str = "") -> requests.Session:
+    session = requests.Session()
+    session.trust_env = False
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
+    return session
+
+
+def http_error_status(error: requests.exceptions.HTTPError) -> int:
+    response = getattr(error, "response", None)
+    return response.status_code if response is not None else 0
+
+
+def http_error_message(error: requests.exceptions.HTTPError) -> str:
+    response = getattr(error, "response", None)
+    if response is None:
+        return str(error)
+
+    try:
+        message = response.text.removeprefix("\n").removesuffix("\n")
+    except Exception:
+        message = ""
+
+    return message or response.reason or str(error)
+
+
 def set_proxy(proxy: Optional[str]) -> None:
-    """Configure the process-wide opener used by search HTTP requests."""
-    global _HTTP_OPENER, _HTTP_PROXY
+    """Configure the process-wide requests session used by search HTTP requests."""
+    global _HTTP_SESSION, _HTTP_PROXY
 
     proxy = trim(proxy)
 
-    # Reset any previous SOCKS monkey-patch before applying the new setting
-    socket.socket = _ORIGINAL_SOCKET
-
     if not proxy:
         _HTTP_PROXY = ""
-        _HTTP_OPENER = urllib.request.build_opener()
+        _HTTP_SESSION = _new_session()
         logger.info("HTTP proxy disabled")
         return
 
@@ -55,49 +77,22 @@ def set_proxy(proxy: Optional[str]) -> None:
     except ValueError as e:
         raise ValueError(f"invalid proxy port: {e}") from e
 
-    if scheme == "socks5":
-        if parsed.port is None:
-            raise ValueError("socks5 proxy must include a port")
-
-        try:
-            import socks
-        except ImportError as e:
-            raise RuntimeError("SOCKS5 proxy requires the PySocks package. Install it with: pip install PySocks") from e
-
-        socks.set_default_proxy(
-            socks.PROXY_TYPE_SOCKS5,
-            parsed.hostname,
-            parsed.port,
-            username=urllib.parse.unquote(parsed.username) if parsed.username else None,
-            password=urllib.parse.unquote(parsed.password) if parsed.password else None,
-        )
-        socket.socket = socks.socksocket
-        _HTTP_OPENER = urllib.request.build_opener()
-    else:
-        _HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-
+    _HTTP_SESSION = _new_session(proxy)
     _HTTP_PROXY = proxy
     logger.info(f"HTTP proxy enabled: {scheme}://{parsed.hostname}:{parsed.port or ''}")
 
 
-def urlopen(request, timeout: float = 10, context=None):
-    """Open a URL through the configured global HTTP proxy when present."""
-    if context is None:
-        return _HTTP_OPENER.open(request, timeout=timeout)
-
-    handlers = [urllib.request.HTTPSHandler(context=context)]
-    parsed = urllib.parse.urlparse(_HTTP_PROXY)
-    if _HTTP_PROXY and parsed.scheme.lower() in {"http", "https"}:
-        handlers.insert(0, urllib.request.ProxyHandler({"http": _HTTP_PROXY, "https": _HTTP_PROXY}))
-
-    return urllib.request.build_opener(*handlers).open(request, timeout=timeout)
+def request(method: str, url: str, timeout: float = 10, **kwargs: Any) -> requests.Response:
+    """Send a request through the configured global session."""
+    response = _HTTP_SESSION.request(method=method, url=url, timeout=max(1, timeout), **kwargs)
+    response.raise_for_status()
+    return response
 
 
 from constant.search import API_RESULTS_PER_PAGE, WEB_RESULTS_PER_PAGE
 from constant.system import (
     CHAT_RETRY_INTERVAL,
     COLLECT_RETRY_INTERVAL,
-    CTX,
     DEFAULT_HEADERS,
     DEFAULT_QUESTION,
     GITHUB_API_INTERVAL,
@@ -319,12 +314,12 @@ def http_get(
             separator = "&" if "?" in encoded_url else "?"
             encoded_url += f"{separator}{data}"
 
-        # Make request with managed network resource
-        request = urllib.request.Request(url=encoded_url, headers=headers)
-        with managed_network(urlopen(request, timeout=timeout, context=CTX), "http_connection") as response:
+        with managed_network(
+            request("GET", encoded_url, headers=headers, timeout=timeout), "http_connection"
+        ) as response:
             # Handle response
-            content = response.read()
-            status_code = response.getcode()
+            content = response.content
+            status_code = response.status_code
 
             if status_code != 200:
                 raise NetworkError(f"HTTP {status_code} error for URL: {url}")
@@ -338,24 +333,29 @@ def http_get(
                 except Exception:
                     raise NetworkError("Failed to decode response content")
 
-    except urllib.error.HTTPError as e:
+    except requests.exceptions.HTTPError as e:
         # Handle HTTP errors with basic classification
-        if e.code == 429:
+        code = http_error_status(e)
+        reason = http_error_message(e)
+        if code == 429:
             # Rate limit errors should be retried
-            raise ConnectionError(f"Rate limit exceeded (HTTP {e.code})")
-        elif e.code in (401, 403):
+            raise ConnectionError(f"Rate limit exceeded (HTTP {code})")
+        elif code in (401, 403):
             # Auth errors should not be retried
-            raise NetworkError(f"Authentication failed (HTTP {e.code})")
-        elif e.code >= 500:
+            raise NetworkError(f"Authentication failed (HTTP {code})")
+        elif code >= 500:
             # Server errors should be retried
-            raise ConnectionError(f"Server error (HTTP {e.code}): {e.reason}")
+            raise ConnectionError(f"Server error (HTTP {code}): {reason}")
         else:
             # Client errors should not be retried
-            raise NetworkError(f"HTTP {e.code} error: {e.reason}")
+            raise NetworkError(f"HTTP {code} error: {reason}")
 
-    except urllib.error.URLError as e:
+    except requests.exceptions.Timeout as e:
+        raise TimeoutError(f"Request timeout: {e}")
+
+    except requests.exceptions.RequestException as e:
         # URL errors are usually network-related and should be retried
-        raise ConnectionError(f"URL error: {e.reason}")
+        raise ConnectionError(f"Request error: {e}")
 
     except Exception as e:
         # Classify unknown errors
@@ -406,25 +406,24 @@ def chat(
     retries = max(1, retries)
     code, message, attempt = 400, None, 0
 
-    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     while attempt < retries:
         try:
-            with urlopen(req, timeout=timeout, context=CTX) as response:
-                code = 200
-                message = response.read().decode("utf8")
+            with request("POST", url, data=payload, headers=headers, timeout=timeout) as response:
+                code = response.status_code
+                message = response.text
                 break
-        except urllib.error.HTTPError as e:
-            code = e.code
+        except requests.exceptions.HTTPError as e:
+            code = http_error_status(e)
             if code != 401:
                 try:
                     # read response body
-                    message = e.read().decode("utf8").removeprefix("\n").removesuffix("\n")
+                    message = http_error_message(e)
 
                     # not a json string, use reason instead
                     if not message.startswith("{") or not message.endswith("}"):
-                        message = e.reason
+                        message = e.response.reason if e.response is not None else str(e)
                 except Exception:
-                    message = e.reason
+                    message = str(e)
 
                 # print http status code and error message
                 output(code=code, message=message, debug=False)

@@ -4,26 +4,24 @@
 StabilityAI provider implementation.
 """
 
-import codecs
 import urllib.parse
-import urllib.request
 
+import requests
 from tools.logger import get_logger
 
 from .registry import register_provider
 
 logger = get_logger("provider")
 import time
-import uuid
 from typing import Dict, List, Optional, Tuple
 
-from constant.system import CTX, NO_RETRY_ERROR_CODES
+from constant.system import NO_RETRY_ERROR_CODES
 from core.enums import ErrorReason
 from core.models import CheckResult, Condition
 from tools.coordinator import get_user_agent
 from tools.utils import trim
 
-from ..client import urlopen
+from ..client import http_error_message, http_error_status, request
 from .base import AIBaseProvider
 
 
@@ -79,63 +77,39 @@ class StabilityAIProvider(AIBaseProvider):
             if not url or not token:
                 return 401, ""
 
-            boundary, contents = str(uuid.uuid4()), []
             if not isinstance(fields, dict):
                 fields = dict()
             if not isinstance(files, dict):
                 files = dict()
 
-            # add common form fields
-            for k, v in fields.items():
-                contents.append(f"--{boundary}")
-                contents.append(f'Content-Disposition: form-data; name="{k}"')
-                contents.append("Content-Type: text/plain")
-                contents.append("")
-                contents.append(v)
-                contents.append("")
-
-            # add files
-            for k, v in files.items():
-                filename, data = v
-                contents.append(f"--{boundary}")
-                contents.append(f'Content-Disposition: form-data; name="{k}"; filename="{filename}"')
-                contents.append("Content-Type: application/octet-stream")
-                contents.append("")
-                contents.append(data)
-                contents.append("")
-
-            # add end flag
-            contents.append(f"--{boundary}--")
-            contents.append("")
-
-            # encode content
-            payload = b"\r\n".join(codecs.encode(x, encoding="utf8") for x in contents)
-
-            req = urllib.request.Request(url, data=payload, method="POST")
-
-            # set request headers
-            req.add_header("Accept", "application/json")
-            req.add_header("Authorization", f"Bearer {token}")
-            req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-            req.add_header("User-Agent", get_user_agent())
+            multipart_files = {name: (None, value) for name, value in fields.items()}
+            for name, value in files.items():
+                filename, data = value
+                multipart_files[name] = (filename, data, "application/octet-stream")
 
             # send request with retry
             code, message, attempt, retries = 401, "", 0, max(1, retries)
             while attempt < retries:
                 try:
-                    with urlopen(req, timeout=15, context=CTX) as response:
-                        code = 200
-                        message = response.read().decode("utf8")
-                        break
-                except urllib.error.HTTPError as e:
-                    code = e.code
+                    response = request(
+                        "POST",
+                        url,
+                        headers={
+                            "Accept": "application/json",
+                            "Authorization": f"Bearer {token}",
+                            "User-Agent": get_user_agent(),
+                        },
+                        files=multipart_files,
+                        timeout=15,
+                    )
+                    code = response.status_code
+                    message = response.text
+                    response.close()
+                    break
+                except requests.exceptions.HTTPError as e:
+                    code = http_error_status(e)
                     if code != 401:
-                        try:
-                            message = e.read().decode("utf8")
-                            if not message.startswith("{") or not message.endswith("}"):
-                                message = e.reason
-                        except:
-                            message = e.reason
+                        message = http_error_message(e)
 
                         logger.error(
                             f"[chat] failed to request URL: {url}, token: {token}, status code: {code}, message: {message}"

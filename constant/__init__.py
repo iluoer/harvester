@@ -53,7 +53,6 @@ from .search import (
 from .system import (
     ALERT_COOLDOWN_SECONDS,
     APPLICATION_BANNER,
-    CTX,
     DEFAULT_ADJUSTMENT_INTERVAL,
     DEFAULT_AUTHORIZATION_HEADER,
     DEFAULT_BATCH_SIZE,
@@ -125,7 +124,6 @@ __all__ = [
     "DEFAULT_AUTHORIZATION_HEADER",
     "DEFAULT_HEADERS",
     "DEFAULT_QUESTION",
-    "CTX",
     "NO_RETRY_ERROR_CODES",
     # Runtime pipeline and queues
     "DEFAULT_THREAD_COUNTS",

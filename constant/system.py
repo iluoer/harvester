@@ -7,7 +7,6 @@ This module contains system-wide limits, timeouts, default configuration values,
 and performance thresholds that define the operational boundaries and default
 behaviors of the system.
 """
-import ssl
 from typing import Dict, Set
 
 # Configuration files
@@ -75,11 +74,6 @@ DEFAULT_SCALE_DOWN_THRESHOLD: float = 0.2  # 20% queue utilization
 # Performance monitoring
 LB_RECENT_HISTORY_SIZE: int = 10  # Number of recent measurements to keep
 PROGRESS_UPDATE_INTERVAL: float = 1.0  # Progress update interval in seconds
-
-# SSL Context (secure by default)
-CTX: ssl.SSLContext = ssl.create_default_context()
-# Keep hostname checking and certificate verification enabled by default for security.
-# If you need to disable verification for local testing, wire a config toggle at call sites.
 
 # Default API paths
 DEFAULT_COMPLETION_PATH: str = "/v1/chat/completions"

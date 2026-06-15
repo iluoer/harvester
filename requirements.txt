@@ -1,6 +1,6 @@
 # Core Dependencies
 PyYAML
-PySocks
+requests
 
 # Development Dependencies (Optional)
 # Uncomment if needed for development
