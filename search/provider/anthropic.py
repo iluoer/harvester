@@ -8,6 +8,7 @@ import json
 import re
 import time
 import traceback
+import urllib.parse
 from typing import Dict, List, Optional
 
 import requests
@@ -17,9 +18,9 @@ from core.enums import ErrorReason
 from core.models import CheckResult, Condition
 from tools.coordinator import get_user_agent
 from tools.logger import get_logger
-from tools.utils import trim
+from tools.utils import handle_exceptions, trim
 
-from ..client import http_error_message, http_error_status, request
+from ..client import http_error_message, http_error_status, http_get, request
 from .base import AIBaseProvider
 from .registry import register_provider
 
@@ -37,7 +38,7 @@ class AnthropicProvider(AIBaseProvider):
                 "name": "anthropic",
                 "base_url": "https://api.anthropic.com",
                 "completion_path": "/v1/messages",
-                "model_path": "",
+                "model_path": "/v1/models",
                 "default_model": "claude-sonnet-4-20250514",
             },
         )
@@ -153,26 +154,62 @@ class AnthropicProvider(AIBaseProvider):
 
         return super()._judge(code, message)
 
-    def inspect(self, token: str, address: str = "", endpoint: str = "") -> List[str]:
-        """List available Anthropic models."""
-        token = trim(token)
-        if not token:
+    @handle_exceptions(default_result=[], log_level="warning")
+    def _fetch_models(self, url: str, headers: Dict) -> List[str]:
+        """Fetch Anthropic models from the Models API."""
+        url = trim(url)
+        if not url:
             return []
 
-        # see: https://docs.anthropic.com/en/docs/about-claude/models
-        return [
-            "claude-opus-4-20250514",
-            "claude-sonnet-4-20250514",
-            "claude-3-7-sonnet-latest",
-            "claude-3-5-sonnet-latest",
-            "claude-3-5-haiku-latest",
-            "claude-3-opus-latest",
-            "claude-3-sonnet-20240229",
-            "claude-3-haiku-20240307",
-            "claude-2.1",
-            "claude-2.0",
-            "claude-instant-1.2",
-        ]
+        models: List[str] = []
+        after_id = ""
+        seen_pages = set()
+
+        while True:
+            params = {"limit": 100}
+            if after_id:
+                params["after_id"] = after_id
+
+            content = http_get(
+                url=url,
+                headers=headers,
+                params=params,
+                interval=1,
+                timeout=self._get_timeout(default=10),
+            )
+            if not content:
+                break
+
+            result = json.loads(content)
+            for item in result.get("data", []):
+                model = trim(item.get("id", ""))
+                if model:
+                    models.append(model)
+
+            if not result.get("has_more", False):
+                break
+
+            after_id = trim(result.get("last_id", ""))
+            if not after_id or after_id in seen_pages:
+                break
+
+            seen_pages.add(after_id)
+
+        return list(dict.fromkeys(models))
+
+    def inspect(self, token: str, address: str = "", endpoint: str = "") -> List[str]:
+        """List available Anthropic models from the Models API."""
+        headers = self._get_headers(token=token)
+        if not headers or not self.model_path:
+            return []
+
+        base_url = trim(address) or self._base_url
+        if not re.match(r"^https?://([\w\-_]+\.[\w\-_]+)+", base_url, flags=re.I):
+            logger.error(f"Invalid domain: {base_url}, skipping model listing")
+            return []
+
+        url = urllib.parse.urljoin(base_url.removesuffix("/") + "/", self.model_path)
+        return self._fetch_models(url=url, headers=headers)
 
 
 register_provider("anthropic", AnthropicProvider)
