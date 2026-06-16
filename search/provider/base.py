@@ -20,12 +20,13 @@ from ..client import chat
 logger = get_logger("provider")
 
 
-def _normalize_path(value: str) -> str:
+def _normalize_path(value: str, strict: bool = True) -> str:
     value = trim(value)
     if not value:
         return ""
 
-    return re.sub(r"[^a-zA-Z0-9_\-]", "-", value, flags=re.I).strip("-").lower()
+    pattern = r"[^a-zA-Z0-9_\-]" if strict else r"[^a-zA-Z0-9_\-/\\]"
+    return re.sub(pattern, "-", value, flags=re.I).strip("-").lower()
 
 
 class AIBaseProvider(IProvider):
@@ -125,9 +126,9 @@ class AIBaseProvider(IProvider):
             plan = trim(storage.get("plan", ""))
 
         if directory and plan:
-            folder = os.path.join(_normalize_path(directory), _normalize_path(plan))
+            folder = os.path.join(_normalize_path(directory, strict=False), _normalize_path(plan))
         elif directory:
-            folder = _normalize_path(directory)
+            folder = _normalize_path(directory, strict=False)
         else:
             folder = _normalize_path(name)
 
