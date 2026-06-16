@@ -257,7 +257,13 @@ class VertexProvider(AIBaseProvider):
                 ]
             }
 
-        code, message = chat(url=url, headers=headers, params=params)
+        code, message = chat(
+            url=url,
+            headers=headers,
+            params=params,
+            retries=self._get_retries(default=2),
+            timeout=self._get_timeout(default=10),
+        )
         return self._judge(code=code, message=message)
 
     def inspect(self, token: str, address: str = "", endpoint: str = "") -> List[str]:

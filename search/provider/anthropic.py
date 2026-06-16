@@ -83,7 +83,7 @@ class AnthropicProvider(AIBaseProvider):
             }
 
             content, success = "", False
-            attempt, retries, timeout = 0, 3, 10
+            attempt, retries, timeout = 0, self._get_retries(default=3), self._get_timeout(default=10)
 
             while attempt < retries:
                 try:

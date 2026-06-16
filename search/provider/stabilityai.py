@@ -7,6 +7,7 @@ StabilityAI provider implementation.
 import urllib.parse
 
 import requests
+
 from tools.logger import get_logger
 
 from .registry import register_provider
@@ -97,7 +98,7 @@ class StabilityAIProvider(AIBaseProvider):
                             "User-Agent": get_user_agent(),
                         },
                         files=multipart_files,
-                        timeout=15,
+                        timeout=self._get_timeout(default=15),
                     )
                     code = response.status_code
                     message = response.text
@@ -130,7 +131,7 @@ class StabilityAIProvider(AIBaseProvider):
         url = f"{urllib.parse.urljoin(self._base_url, self.completion_path)}/{model}"
         fields = {"prompt": "Lighthouse on a cliff overlooking the ocean", "aspect_ratio": "3:2"}
 
-        code, message = post_multipart(url=url, token=token, fields=fields)
+        code, message = post_multipart(url=url, token=token, fields=fields, retries=self._get_retries(default=3))
         return self._judge(code=code, message=message)
 
     def inspect(self, token: str, address: str = "", endpoint: str = "") -> List[str]:

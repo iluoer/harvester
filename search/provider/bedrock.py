@@ -210,16 +210,24 @@ class BedrockProvider(AIBaseProvider):
 
     def _send_request(self, method: str, url: str, headers: Dict[str, str], payload: str = "") -> tuple:
         """Send HTTP request and return status code and response."""
+        timeout = self._get_timeout(default=30)
+
         try:
             if method == "GET":
-                response = http_get(url=url, headers=headers, retries=2, timeout=30)
+                response = http_get(url=url, headers=headers, retries=self._get_retries(default=2), timeout=timeout)
                 if response:
                     return 200, response
                 else:
                     return 500, "Request failed"
             elif method == "POST":
                 try:
-                    with request("POST", url, data=payload.encode("utf-8"), headers=headers, timeout=30) as response:
+                    with request(
+                        "POST",
+                        url,
+                        data=payload.encode("utf-8"),
+                        headers=headers,
+                        timeout=timeout,
+                    ) as response:
                         return response.status_code, response.text
                 except requests.exceptions.HTTPError as e:
                     return http_error_status(e), http_error_message(e)

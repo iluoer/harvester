@@ -55,7 +55,13 @@ class QianFanProvider(OpenAILikeProvider):
         model = trim(model) or self._default_model
         url = urllib.parse.urljoin(self._base_url, self.completion_path)
 
-        code, message = chat(url=url, headers=headers, model=model)
+        code, message = chat(
+            url=url,
+            headers=headers,
+            model=model,
+            retries=self._get_retries(default=2),
+            timeout=self._get_timeout(default=10),
+        )
         return self._judge(code=code, message=message)
 
     def inspect(self, token: str, address: str = "", endpoint: str = "") -> List[str]:

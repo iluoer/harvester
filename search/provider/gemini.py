@@ -84,7 +84,13 @@ class GeminiProvider(AIBaseProvider):
         url = f"{urllib.parse.urljoin(self._base_url, self.completion_path)}/{model}:generateContent?key={token}"
 
         params = {"contents": [{"role": "user", "parts": [{"text": DEFAULT_QUESTION}]}]}
-        code, message = chat(url=url, headers=self._get_headers(token=token), params=params)
+        code, message = chat(
+            url=url,
+            headers=self._get_headers(token=token),
+            params=params,
+            retries=self._get_retries(default=2),
+            timeout=self._get_timeout(default=10),
+        )
         return self._judge(code=code, message=message)
 
     def inspect(self, token: str, address: str = "", endpoint: str = "") -> List[str]:

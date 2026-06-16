@@ -47,6 +47,8 @@ def http_error_message(error: requests.exceptions.HTTPError) -> str:
 
     try:
         message = response.text.removeprefix("\n").removesuffix("\n")
+        if len(message) > 300:
+            message = message[:300]
     except Exception:
         message = ""
 

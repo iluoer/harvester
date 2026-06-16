@@ -204,6 +204,12 @@ class AIBaseProvider(IProvider):
 
         return CheckResult.fail(ErrorReason.UNKNOWN)
 
+    def _get_retries(self, default: int) -> int:
+        return self.extras.get("retries", max(default, 0))
+
+    def _get_timeout(self, default: int) -> int:
+        return self.extras.get("timeout", max(default, 0))
+
     def check(self, token: str, address: str = "", endpoint: str = "", model: str = "") -> CheckResult:
         """Check if token is valid."""
         url, regex = trim(address), r"^https?://([\w\-_]+\.[\w\-_]+)+"
@@ -219,7 +225,14 @@ class AIBaseProvider(IProvider):
             return CheckResult.fail(ErrorReason.BAD_REQUEST)
 
         model = trim(model) or self._default_model
-        code, message = chat(url=url, headers=headers, model=model)
+
+        code, message = chat(
+            url=url,
+            headers=headers,
+            model=model,
+            retries=self._get_retries(default=2),
+            timeout=self._get_timeout(default=10),
+        )
         return self._judge(code=code, message=message)
 
     def inspect(self, token: str, address: str = "", endpoint: str = "") -> List[str]:
