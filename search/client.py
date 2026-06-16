@@ -292,6 +292,7 @@ def http_get(
     Raises:
         ValidationError: For invalid input
         NetworkError: For network-related issues
+        FileNotFoundError: For access resource not exists
         ConnectionError: For connection failures (will be retried)
         TimeoutError: For timeout errors (will be retried)
 
@@ -300,6 +301,7 @@ def http_get(
         parameters to configure retry behavior dynamically. Retry logic uses
         exponential backoff with jitter for optimal performance.
     """
+
     # Input validation
     if isblank(url):
         raise ValidationError("URL cannot be empty", field="url")
@@ -342,6 +344,8 @@ def http_get(
         if code == 429:
             # Rate limit errors should be retried
             raise ConnectionError(f"Rate limit exceeded (HTTP {code})")
+        elif code == 404:
+            raise FileNotFoundError(f"File not found (HTTP {code}), url: {url}")
         elif code in (401, 403):
             # Auth errors should not be retried
             raise NetworkError(f"Authentication failed (HTTP {code})")
