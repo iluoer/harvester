@@ -331,7 +331,7 @@ class BedrockProvider(AIBaseProvider):
         """Get headers for AWS Bedrock API requests. Not used directly."""
         # This method is required by base class but not used in Bedrock
         # since we use SigV4 signing instead of simple token auth
-        return {"Content-Type": "application/json"}
+        return self._merge_headers({"Content-Type": "application/json"}, additional)
 
     def _build_test_payload(self, model_id: str) -> str:
         """Build appropriate test payload based on model type."""

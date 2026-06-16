@@ -51,7 +51,8 @@ class GeminiProvider(AIBaseProvider):
 
     def _get_headers(self, token: str, additional: Optional[Dict] = None) -> Optional[Dict]:
         """Get headers for Gemini API requests."""
-        return {"accept": "application/json", "content-type": "application/json"}
+        headers = {"accept": "application/json", "content-type": "application/json"}
+        return self._merge_headers(headers, additional)
 
     def _judge(self, code: int, message: str) -> CheckResult:
         """Judge Gemini API response."""

@@ -13,7 +13,7 @@ from typing import Callable, Dict, List, Optional, Set
 
 import constant
 from config import load_config
-from config.schemas import Config, TaskConfig
+from config.schemas import ApiConfig, Config, TaskConfig
 from core.models import Condition, Patterns, ProviderTask, SearchTask, TaskRecoveryInfo
 from core.types import IProvider
 from search import client
@@ -111,6 +111,24 @@ class ProviderFactory:
         for key, value in params.items():
             if trim(value):
                 kwargs[key] = value
+
+        if trim(api_config.auth_key):
+            kwargs["auth_key"] = api_config.auth_key
+
+        if isinstance(api_config.extra_headers, dict) and api_config.extra_headers:
+            extra_headers = kwargs.get("extra_headers", {})
+            if not isinstance(extra_headers, dict):
+                extra_headers = {}
+
+            kwargs["extra_headers"] = {**extra_headers, **api_config.extra_headers}
+
+        if trim(api_config.api_version):
+            kwargs["api_version"] = api_config.api_version
+
+        if isinstance(api_config.timeout, (int, float)) and api_config.timeout > 0:
+            kwargs["timeout"] = api_config.timeout
+        if type(api_config.retries) == int and api_config.retries > 0:
+            kwargs["retries"] = api_config.retries
 
         return ProviderRegistry.create(provider_type, conditions=conditions, **kwargs)
 

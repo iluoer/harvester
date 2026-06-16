@@ -58,12 +58,13 @@ class AnthropicProvider(AIBaseProvider):
         if not token:
             return None
 
-        return {
+        headers = {
             "accept": "application/json",
             "content-type": "application/json",
             "x-api-key": token,
             "anthropic-version": "2023-06-01",
         }
+        return self._merge_headers(headers, additional)
 
     def check(self, token: str, address: str = "", endpoint: str = "", model: str = "") -> CheckResult:
         """Check Anthropic token validity."""

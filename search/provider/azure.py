@@ -49,9 +49,11 @@ class AzureOpenAIProvider(OpenAILikeProvider):
             if not condition.patterns.endpoint_pattern:
                 condition.patterns.endpoint_pattern = r"/deployments/([a-zA-Z0-9_\-]+)/chat"
 
+        api_version = trim(kwargs.get("api_version", ""))
+
         super().__init__(conditions=conditions, **kwargs)
 
-        self.api_version = "2024-10-21"
+        self.api_version = api_version or "2024-10-21"
 
     def _get_headers(self, token: str, additional: Optional[Dict] = None) -> Optional[Dict]:
         """Get headers for Azure OpenAI API requests."""
@@ -59,12 +61,13 @@ class AzureOpenAIProvider(OpenAILikeProvider):
         if not token:
             return None
 
-        return {
+        headers = {
             "accept": "application/json",
             "api-key": token,
             "content-type": "application/json",
             "user-agent": get_user_agent(),
         }
+        return self._merge_headers(headers, additional)
 
     def _judge(self, code: int, message: str) -> CheckResult:
         """Judge Azure OpenAI API response."""

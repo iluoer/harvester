@@ -169,6 +169,20 @@ class AIBaseProvider(IProvider):
         """Get headers for API requests. Must be implemented by subclasses."""
         raise NotImplementedError
 
+    def _merge_headers(self, headers: Optional[Dict], additional: Optional[Dict] = None) -> Optional[Dict]:
+        """Merge provider configured headers with request-specific headers."""
+        if not isinstance(headers, dict):
+            return headers
+
+        extra_headers = self.extras.get("extra_headers", {}) if isinstance(self.extras, dict) else {}
+        if isinstance(extra_headers, dict):
+            headers.update(extra_headers)
+
+        if isinstance(additional, dict):
+            headers.update(additional)
+
+        return headers
+
     def _judge(self, code: int, message: str) -> CheckResult:
         """Judge API response and return check result."""
         message = trim(message)

@@ -47,16 +47,16 @@ class GooeyAIProvider(AIBaseProvider):
         """Get headers for GooeyAI API requests."""
         token = trim(token)
 
-        return (
-            {
-                "accept": "application/json",
-                "content-type": "application/json",
-                "authorization": f"Bearer {token}",
-                "user-agent": get_user_agent(),
-            }
-            if token
-            else None
-        )
+        if not token:
+            return None
+
+        headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "authorization": f"Bearer {token}",
+            "user-agent": get_user_agent(),
+        }
+        return self._merge_headers(headers, additional)
 
     def check(self, token: str, address: str = "", endpoint: str = "", model: str = "") -> CheckResult:
         """Check GooeyAI token validity."""

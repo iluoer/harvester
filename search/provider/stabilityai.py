@@ -62,10 +62,7 @@ class StabilityAIProvider(AIBaseProvider):
             "Content-Type": "multipart/form-data",
             "Accept": "application/json",
         }
-        if additional and isinstance(additional, dict):
-            headers.update(additional)
-
-        return headers
+        return self._merge_headers(headers, additional)
 
     def check(self, token: str, address: str = "", endpoint: str = "", model: str = "") -> CheckResult:
         """Check StabilityAI token validity."""

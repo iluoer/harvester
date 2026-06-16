@@ -65,11 +65,12 @@ class VertexProvider(AIBaseProvider):
         if not token:
             return None
 
-        return {
+        headers = {
             "accept": "application/json",
             "content-type": "application/json",
             "authorization": f"Bearer {token}",
         }
+        return self._merge_headers(headers, additional)
 
     def detect_publisher(self, model: str) -> str:
         """Detect publisher from model name."""

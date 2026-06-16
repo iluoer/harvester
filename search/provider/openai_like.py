@@ -87,9 +87,8 @@ class OpenAILikeProvider(AIBaseProvider):
             auth_key: auth_value,
             "user-agent": get_user_agent(),
         }
-        headers.update(additional)
 
-        return headers
+        return self._merge_headers(headers, additional)
 
     def _judge(self, code: int, message: str) -> CheckResult:
         """Judge OpenAI-like API response."""
