@@ -460,7 +460,7 @@ def search_github_web(query: str, session: str, page: int) -> str:
 
     client = get_github_client()
     content = client.get(url=url, headers=headers)
-    if re.search(r"<h1>Sign in to GitHub</h1>", content, flags=re.I):
+    if re.search(r"<title>Sign in to GitHub · GitHub</title>", content, flags=re.I):
         logger.error("[GithubCrawl] Session has expired, please provide a valid session and try again")
         return ""
 
