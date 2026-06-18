@@ -29,8 +29,8 @@ from core.models import (
     Service,
 )
 from core.types import IProvider
-from refine.engine import RefineEngine
 from search import client
+from search.github.refine.engine import RefineEngine
 from tools.logger import get_logger
 from tools.state import GithubCredentialLimited
 from tools.utils import get_service_name, handle_exceptions

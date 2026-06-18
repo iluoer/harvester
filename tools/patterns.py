@@ -21,9 +21,7 @@ API_KEY_PATTERNS = [
 GITHUB_QUERY_PATTERN = r"/([^/]+)/"
 
 # Pre-compiled patterns for performance
-COMPILED_API_KEY_PATTERNS: List[Pattern[str]] = [
-    re.compile(pattern) for pattern in API_KEY_PATTERNS
-]
+COMPILED_API_KEY_PATTERNS: List[Pattern[str]] = [re.compile(pattern) for pattern in API_KEY_PATTERNS]
 
 COMPILED_GITHUB_QUERY_PATTERN: Pattern[str] = re.compile(GITHUB_QUERY_PATTERN)
 

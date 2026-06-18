@@ -12,10 +12,9 @@ from typing import Dict, List, Optional, Union
 from core.enums import ErrorReason
 from core.models import CheckResult, Condition, Patterns, ResultStorage
 from core.types import IProvider
+from search.client import chat
 from tools.logger import get_logger
 from tools.utils import trim
-
-from ..client import chat
 
 logger = get_logger("provider")
 

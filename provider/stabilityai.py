@@ -19,10 +19,10 @@ from typing import Dict, List, Optional, Tuple
 from constant.system import NO_RETRY_ERROR_CODES
 from core.enums import ErrorReason
 from core.models import CheckResult, Condition
+from search.client import http_error_message, http_error_status, request
 from tools.coordinator import get_user_agent
 from tools.utils import trim
 
-from ..client import http_error_message, http_error_status, request
 from .base import AIBaseProvider
 
 

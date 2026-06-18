@@ -16,10 +16,10 @@ from typing import Dict, List, Optional
 from constant.system import DEFAULT_COMPLETION_PATH, DEFAULT_MODEL_PATH
 from core.enums import ErrorReason
 from core.models import CheckResult, Condition
+from search.client import http_get
 from tools.coordinator import get_user_agent
 from tools.utils import handle_exceptions, trim
 
-from ..client import http_get
 from .base import AIBaseProvider
 from .registry import register_provider
 

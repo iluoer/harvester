@@ -16,9 +16,9 @@ from typing import Dict, List, Optional
 from constant.system import DEFAULT_QUESTION
 from core.enums import ErrorReason
 from core.models import CheckResult, Condition
+from search.client import chat, http_get
 from tools.utils import trim
 
-from ..client import chat, http_get
 from .base import AIBaseProvider
 from .registry import register_provider
 

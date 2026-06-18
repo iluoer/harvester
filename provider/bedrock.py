@@ -17,10 +17,10 @@ import requests
 from constant.system import DEFAULT_QUESTION
 from core.enums import ErrorReason
 from core.models import CheckResult, Condition
+from search.client import http_error_message, http_error_status, http_get, request
 from tools.logger import get_logger
 from tools.utils import trim
 
-from ..client import http_error_message, http_error_status, http_get, request
 from .base import AIBaseProvider
 from .registry import register_provider
 

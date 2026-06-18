@@ -9,10 +9,10 @@ from typing import Dict, List, Optional
 
 from core.enums import ErrorReason
 from core.models import CheckResult, Condition
+from search.client import chat
 from tools.coordinator import get_user_agent
 from tools.utils import trim
 
-from ..client import chat
 from .base import AIBaseProvider
 from .registry import register_provider
 

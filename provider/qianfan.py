@@ -9,9 +9,9 @@ from typing import List
 
 from core.enums import ErrorReason
 from core.models import CheckResult, Condition
+from search.client import chat
 from tools.utils import trim
 
-from ..client import chat
 from .openai_like import OpenAILikeProvider
 from .registry import register_provider
 

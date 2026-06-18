@@ -13,12 +13,12 @@ from typing import Callable, Dict, List, Optional, Set
 
 import constant
 from config import load_config
-from config.schemas import ApiConfig, Config, TaskConfig
+from config.schemas import Config, TaskConfig
 from core.models import Condition, Patterns, ProviderTask, SearchTask, TaskRecoveryInfo
 from core.types import IProvider
+from provider.base import AIBaseProvider
+from provider.registry import ProviderRegistry
 from search import client
-from search.provider.base import AIBaseProvider
-from search.provider.registry import ProviderRegistry
 from stage.base import StageUtils
 from stage.factory import TaskFactory
 from state.builder import StatusBuilder
