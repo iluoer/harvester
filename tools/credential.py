@@ -15,10 +15,17 @@ Key Features:
 """
 
 import threading
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+from constant.system import SERVICE_TYPE_GITHUB_API, SERVICE_TYPE_GITHUB_WEB
+
 from .balancer import Balancer, Strategy
+from .logger import get_logger
+from .state import github_credential_state, mask_credential
+
+logger = get_logger("manager")
 
 
 @dataclass
@@ -86,13 +93,17 @@ class Credentials:
         Returns:
             Optional[str]: Session token or None if no sessions available
         """
-        if not self.session_balancer:
-            return None
-
-        with self.lock:
-            self.total_requests += 1
-            self.session_requests += 1
-            return self.session_balancer.get()
+        credential = self._get_available(
+            service=SERVICE_TYPE_GITHUB_WEB,
+            balancer=self.session_balancer,
+            items=self.sessions,
+            label="session",
+        )
+        if credential:
+            with self.lock:
+                self.total_requests += 1
+                self.session_requests += 1
+        return credential
 
     def get_token(self) -> Optional[str]:
         """Get next API token
@@ -100,13 +111,47 @@ class Credentials:
         Returns:
             Optional[str]: API token or None if no tokens available
         """
-        if not self.token_balancer:
+        credential = self._get_available(
+            service=SERVICE_TYPE_GITHUB_API,
+            balancer=self.token_balancer,
+            items=self.tokens,
+            label="token",
+        )
+        if credential:
+            with self.lock:
+                self.total_requests += 1
+                self.token_requests += 1
+        return credential
+
+    def _get_available(
+        self,
+        service: str,
+        balancer: Optional[Balancer[str]],
+        items: List[str],
+        label: str,
+    ) -> Optional[str]:
+        """Get a credential that is not cooling down"""
+        if not balancer or not items:
             return None
 
-        with self.lock:
-            self.total_requests += 1
-            self.token_requests += 1
-            return self.token_balancer.get()
+        while True:
+            count = len(items)
+            for _ in range(count):
+                credential = balancer.get()
+                if not github_credential_state.is_cooling(service, credential):
+                    return credential
+
+            wait = github_credential_state.next_wait(service, items)
+            if wait <= 0:
+                time.sleep(0.1)
+                continue
+
+            masked = ", ".join(mask_credential(item) for item in items)
+            logger.warning(
+                f"[github] all {label} credentials are cooling down, pause search for {wait:.1f}s, "
+                f"credentials: {masked}"
+            )
+            time.sleep(wait)
 
     def get_credential(self, prefer_token: bool = True) -> Tuple[str, str]:
         """Get next credential with type preference

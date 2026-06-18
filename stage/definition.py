@@ -32,6 +32,7 @@ from core.types import IProvider
 from refine.engine import RefineEngine
 from search import client
 from tools.logger import get_logger
+from tools.state import GithubCredentialLimited
 from tools.utils import get_service_name, handle_exceptions
 
 from .base import BasePipelineStage, OutputHandler, StageOutput, StageResources
@@ -141,25 +142,31 @@ class SearchStage(BasePipelineStage):
 
     def _execute_first_page_search(self, task: SearchTask) -> Tuple[List[str], str, int]:
         """Execute first page search and get total count in single request"""
-        # Apply rate limiting
-        self._apply_rate_limit(task.use_api)
+        while True:
+            # Get auth via injected provider
+            if task.use_api:
+                auth_token = self.resources.auth.get_token()
+            else:
+                auth_token = self.resources.auth.get_session()
 
-        # Get auth via injected provider
-        if task.use_api:
-            auth_token = self.resources.auth.get_token()
-        else:
-            auth_token = self.resources.auth.get_session()
+            if not auth_token:
+                return [], "", 0
 
-        # Execute search with count - now returns content as well
-        results, total, content = client.search_with_count(
-            query=self._preprocess_query(task.query, task.use_api),
-            session=auth_token,
-            page=task.page,
-            with_api=task.use_api,
-            peer_page=API_RESULTS_PER_PAGE if task.use_api else WEB_RESULTS_PER_PAGE,
-        )
-
-        return results, content, total
+            try:
+                # Execute search with count - now returns content as well
+                results, total, content = client.search_with_count(
+                    query=self._preprocess_query(task.query, task.use_api),
+                    session=auth_token,
+                    page=task.page,
+                    with_api=task.use_api,
+                    peer_page=API_RESULTS_PER_PAGE if task.use_api else WEB_RESULTS_PER_PAGE,
+                )
+                return results, content, total
+            except GithubCredentialLimited as e:
+                logger.warning(
+                    f"[{self.name}] GitHub credential cooling during first-page search, "
+                    f"retry with another credential, wait: {e.wait:.1f}s"
+                )
 
     def _preprocess_query(self, query: str, use_api: bool) -> str:
         """Github Rest API search syntax don't support regex, so we need remove it if exists"""
@@ -172,25 +179,31 @@ class SearchStage(BasePipelineStage):
 
     def _execute_page_search(self, task: SearchTask) -> Tuple[List[str], str]:
         """Execute subsequent page search in single request"""
-        # Apply rate limiting
-        self._apply_rate_limit(task.use_api)
+        while True:
+            # Get auth via injected provider
+            if task.use_api:
+                auth_token = self.resources.auth.get_token()
+            else:
+                auth_token = self.resources.auth.get_session()
 
-        # Get auth via injected provider
-        if task.use_api:
-            auth_token = self.resources.auth.get_token()
-        else:
-            auth_token = self.resources.auth.get_session()
+            if not auth_token:
+                return [], ""
 
-        # Execute search - now returns content as well
-        results, content = client.search_code(
-            query=self._preprocess_query(task.query, task.use_api),
-            session=auth_token,
-            page=task.page,
-            with_api=task.use_api,
-            peer_page=API_RESULTS_PER_PAGE if task.use_api else WEB_RESULTS_PER_PAGE,
-        )
-
-        return results, content
+            try:
+                # Execute search - now returns content as well
+                results, content = client.search_code(
+                    query=self._preprocess_query(task.query, task.use_api),
+                    session=auth_token,
+                    page=task.page,
+                    with_api=task.use_api,
+                    peer_page=API_RESULTS_PER_PAGE if task.use_api else WEB_RESULTS_PER_PAGE,
+                )
+                return results, content
+            except GithubCredentialLimited as e:
+                logger.warning(
+                    f"[{self.name}] GitHub credential cooling during page search, "
+                    f"retry with another credential, wait: {e.wait:.1f}s"
+                )
 
     def _apply_rate_limit(self, use_api: bool) -> bool:
         """Apply rate limiting for GitHub requests"""

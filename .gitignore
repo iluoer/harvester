@@ -136,4 +136,4 @@ local.json
 /cmd/histories.cmd
 cmd/*.txt
 cmd/*.json
-config.yaml
+config.yaml*
